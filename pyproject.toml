@@ -1,0 +1,21 @@
+[project]
+name = "blockbench-mcp"
+version = "0.1.0"
+description = "Python MCP Server for creating and editing Blockbench (Minecraft) models via natural language."
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]>=1.2,<2",
+    "pillow>=10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "lzstring>=1.0",
+]
+build = [
+    "pyinstaller>=6",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

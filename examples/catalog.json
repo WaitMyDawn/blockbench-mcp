@@ -1,0 +1,89 @@
+{
+  "version": 1,
+  "note": "样例以完整 .bbmodel 文件存放在 models/ 下，本清单登记许可证与来源。无许可证声明的一律视为 ARR（All Rights Reserved），默认不收录。",
+  "samples": [
+    {
+      "id": "redeemer",
+      "name": "Redeemer",
+      "description": "GeckoLib 武器（模组成品基准：234 立方体、3 骨骼、内嵌纹理）",
+      "file": "models/redeemer.bbmodel",
+      "format": "geckolib_model",
+      "license": "ARR（作者自持；对外发布本项目前请显式声明其开源许可）",
+      "license_spdx": null,
+      "author": "Yagen",
+      "source": "本地原件 d:\\Ps_2022_PSD\\item\\blockbench\\Redeemer.bbmodel",
+      "tags": ["geckolib", "item", "rifle", "weapon", "custom"],
+      "features": "参考用途：GeckoLib 成品道具的部件比例、骨骼布局与贴图内嵌方式"
+    },
+    {
+      "id": "polar_bear",
+      "name": "Polar Bear (Bedrock Entity)",
+      "description": "bmaMC 仓库的极地熊样例：Bedrock 实体模型 + 两组动画，用于学习生物骨骼/动画结构",
+      "file": "models/polar_bear.bbmodel",
+      "format": "bedrock",
+      "license": "MIT",
+      "license_spdx": "MIT",
+      "author": "GodaOo",
+      "source": "https://github.com/GodaOo/bmaMC (example_model/polar_bear.bbmodel)",
+      "tags": ["bedrock", "entity", "mob", "animation"],
+      "features": "10 cubes / 8 bones / 2 animations (walk 等) / 128x64 内嵌纹理",
+      "attribution": "bmaMC by GodaOo, MIT License"
+    },
+    {
+      "id": "bettermodel_demon_knight",
+      "name": "Demon Knight",
+      "description": "BetterModel 仓库的人形骑士：323 立方体 / 30 骨骼 / 10 组动画，学习 Java 模组实体建模",
+      "file": "models/bettermodel_demon_knight.bbmodel",
+      "format": "free",
+      "license": "MIT",
+      "license_spdx": "MIT",
+      "author": "toxicity188 (BetterModel)",
+      "source": "https://github.com/toxicity188/BetterModel (core/src/main/resources/demon_knight.bbmodel)",
+      "tags": ["free", "entity", "humanoid", "animation", "java-mod"],
+      "features": "323 cubes / 30 bones / 10 animations，旧版 4.10 outliner 会自动升级为 5.0 结构",
+      "attribution": "BetterModel by toxicity188, MIT License"
+    },
+    {
+      "id": "img2bb_chimpanzee",
+      "name": "Chimpanzee (img2blockbench)",
+      "description": "img2blockbench 照片转 Blockbench 演示：有机体形状与自由格式建模参考",
+      "file": "models/img2bb_chimpanzee.bbmodel",
+      "format": "free",
+      "license": "MIT",
+      "license_spdx": "MIT",
+      "author": "orca-gamedev (img2blockbench)",
+      "source": "https://github.com/orca-gamedev/img2blockbench (demo/public/models/chimpanzee-lane1.bbmodel)",
+      "tags": ["free", "animal", "organic", "photo-reference"],
+      "features": "22 cubes / 20 bones，演示按参考照片生成体块",
+      "attribution": "img2blockbench by orca-gamedev, MIT License"
+    },
+    {
+      "id": "img2bb_coyote",
+      "name": "Coyote (img2blockbench)",
+      "description": "img2blockbench 照片转 Blockbench 演示：四足动物体块布局参考",
+      "file": "models/img2bb_coyote.bbmodel",
+      "format": "free",
+      "license": "MIT",
+      "license_spdx": "MIT",
+      "author": "orca-gamedev (img2blockbench)",
+      "source": "https://github.com/orca-gamedev/img2blockbench (demo/public/models/coyote-lane1.bbmodel)",
+      "tags": ["free", "animal", "quadruped", "photo-reference"],
+      "features": "20 cubes / 16 bones",
+      "attribution": "img2blockbench by orca-gamedev, MIT License"
+    },
+    {
+      "id": "img2bb_elephant",
+      "name": "Elephant (img2blockbench)",
+      "description": "img2blockbench 照片转 Blockbench 演示：大型四足动物参考",
+      "file": "models/img2bb_elephant.bbmodel",
+      "format": "free",
+      "license": "MIT",
+      "license_spdx": "MIT",
+      "author": "orca-gamedev (img2blockbench)",
+      "source": "https://github.com/orca-gamedev/img2blockbench (demo/public/models/elephant-lane1.bbmodel)",
+      "tags": ["free", "animal", "quadruped", "photo-reference"],
+      "features": "21 cubes / 16 bones",
+      "attribution": "img2blockbench by orca-gamedev, MIT License"
+    }
+  ]
+}

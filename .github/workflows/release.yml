@@ -1,0 +1,32 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install "mcp[cli]>=1.2,<2" pyinstaller
+      - name: Build exe
+        run: |
+          pyinstaller --noconfirm --onefile --name blockbench-mcp --collect-all mcp main.py
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: blockbench-mcp-windows
+          path: dist/blockbench-mcp.exe
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/blockbench-mcp.exe
+
