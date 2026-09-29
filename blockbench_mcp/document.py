@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import math
 import uuid as uuid_lib
 from dataclasses import dataclass, field
 from typing import Any, Iterable
@@ -36,25 +37,31 @@ def new_uuid() -> str:
     return str(uuid_lib.uuid4())
 
 
+def finite_number(value: Any, name: str, *, minimum: float | None = None) -> float:
+    """Validate numbers before mutating a document; JSON cannot represent NaN/Inf."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValidationError(f"{name} 必须是有限数值，收到 {value!r}") from None
+    if not math.isfinite(number) or (minimum is not None and number < minimum):
+        suffix = f"且不小于 {minimum:g}" if minimum is not None else ""
+        raise ValidationError(f"{name} 必须是有限数值{suffix}，收到 {value!r}")
+    return number
+
+
 def _as_vec3(value: Any, name: str) -> Vec3:
     if not isinstance(value, (list, tuple)) or len(value) != 3:
         raise ValidationError(f"{name} 必须是长度为 3 的数值数组，收到 {value!r}")
     out: Vec3 = []
     for v in value:
-        try:
-            out.append(float(v))
-        except (TypeError, ValueError):
-            raise ValidationError(f"{name} 的元素必须是数值，收到 {value!r}") from None
+        out.append(finite_number(v, name))
     return out
 
 
 def _as_vec2(value: Any, name: str) -> list[float]:
     if not isinstance(value, (list, tuple)) or len(value) not in (2, 3):
         raise ValidationError(f"{name} 必须是长度为 2 的数值数组，收到 {value!r}")
-    try:
-        return [float(v) for v in value[:2]]
-    except (TypeError, ValueError):
-        raise ValidationError(f"{name} 的元素必须是数值，收到 {value!r}") from None
+    return [finite_number(v, name) for v in value[:2]]
 
 
 def _vec_all_zero(v: Vec3) -> bool:
@@ -210,7 +217,7 @@ def parse_faces(data: dict[str, Any]) -> dict[str, Face]:
         if len(uv) == 2:  # 兼容只有起点的旧文件，补成矩形
             uv = [uv[0], uv[1], uv[0], uv[1]]
         faces[key] = Face(
-            uv=[float(x) for x in uv[:4]],
+            uv=[finite_number(x, "uv") for x in uv[:4]],
             texture=raw.get("texture") if isinstance(raw.get("texture"), str) else None,
             rotation=int(raw.get("rotation") or 0),
         )
@@ -232,13 +239,13 @@ def parse_faces_spec(
         if key not in FACE_KEYS:
             raise ValidationError(f"未知面 {key!r}", f"可用面：{', '.join(FACE_KEYS)}")
         if isinstance(raw, dict) and "uv" in raw and isinstance(raw["uv"], (list, tuple)) and len(raw["uv"]) == 4:
-            parsed[key] = Face(uv=[float(x) for x in raw["uv"][:4]], texture=texture_uuid)
+            parsed[key] = Face(uv=[finite_number(x, "uv") for x in raw["uv"][:4]], texture=texture_uuid)
         elif isinstance(raw, dict) and isinstance(raw.get("uv"), dict):
             rect = raw["uv"]
-            u = rect.get("uv", [0, 0])
-            s = rect.get("uv_size", [0, 0])
+            u = _as_vec2(rect.get("uv", [0, 0]), "uv")
+            s = _as_vec2(rect.get("uv_size", [0, 0]), "uv_size")
             parsed[key] = Face(
-                uv=[float(u[0]), float(u[1]), float(u[0] + s[0]), float(u[1] + s[1])],
+                uv=[u[0], u[1], finite_number(u[0] + s[0], "uv"), finite_number(u[1] + s[1], "uv")],
                 texture=texture_uuid,
             )
         else:
@@ -614,7 +621,7 @@ class BlockbenchProject:
         anim = Animation(
             uuid=new_uuid(),
             name=name or "animation",
-            length=max(0.0, float(length)),
+            length=finite_number(length, "length", minimum=0),
             loop=loop,
             override=bool(override),
         )
@@ -641,12 +648,12 @@ class BlockbenchProject:
                 "可用：linear / step / bezier / catmullrom",
             )
         vals = _as_vec3(values, "values")
+        t = finite_number(time, "time", minimum=0)
         animator = anim.animators.setdefault(
             group.uuid,
             Animator(bone_uuid=group.uuid, bone_name=group.name),
         )
         animator.bone_name = group.name
-        t = max(0.0, float(time))
         # 同一骨骼同一通道同一时间只保留一个关键帧（与 Blockbench 行为一致）
         animator.keyframes = [
             k for k in animator.keyframes
@@ -664,6 +671,7 @@ class BlockbenchProject:
         channel: str,
         time: float,
     ) -> Keyframe:
+        time = finite_number(time, "time", minimum=0)
         anim = self.animation(animation_uuid_or_name)
         group = self.group(bone_uuid_or_name)
         animator = anim.animators.get(group.uuid)

@@ -13,6 +13,7 @@ from typing import Any
 
 from ..document import BlockbenchProject, Element, Keyframe
 from ..errors import ExportError
+from ..geometry import world_cubes
 
 
 def _num(v: Any) -> float:
@@ -97,7 +98,7 @@ def _round(v: float) -> float:
     return int(r) if r.is_integer() else r
 
 
-def geometry_json(project: BlockbenchProject) -> dict[str, Any]:
+def geometry_json(project: BlockbenchProject, render_bounds: dict | None = None) -> dict[str, Any]:
     """生成 Bedrock 实体几何体 JSON。"""
     bones: list[dict[str, Any]] = []
 
@@ -154,6 +155,13 @@ def geometry_json(project: BlockbenchProject) -> dict[str, Any]:
     description["visible_bounds_width"] = w
     description["visible_bounds_height"] = h
     description["visible_bounds_offset"] = [0.0, offset, 0.0]
+    if render_bounds is not None:
+        from ..document import finite_number, _as_vec3
+        description.update(
+            visible_bounds_width=finite_number(render_bounds["visible_bounds_width"], "visible_bounds_width", minimum=0.001),
+            visible_bounds_height=finite_number(render_bounds["visible_bounds_height"], "visible_bounds_height", minimum=0.001),
+            visible_bounds_offset=_as_vec3(render_bounds["visible_bounds_offset"], "visible_bounds_offset"),
+        )
 
     entity: dict[str, Any] = {"description": description}
     if bones:
@@ -176,29 +184,21 @@ def _geometry_format_version(project: BlockbenchProject) -> str:
 
 
 def _visible_box(project: BlockbenchProject) -> tuple[float, float, float]:
-    """粗略包围盒（块数）。比 Blockbench 的精确算法简单，但保证模型不被裁剪。"""
-    if not project.elements:
-        return 1.0, 1.0, 0.0
+    """Static world-space bounds, including cube and ancestor rotations (16 units/block)."""
     xs: list[float] = []
     ys: list[float] = []
     zs: list[float] = []
-    for el in project.elements:
-        if not el.export:
-            continue
-        for corner_x in (el.from_[0], el.to[0]):
-            for corner_y in (el.from_[1], el.to[1]):
-                for corner_z in (el.from_[2], el.to[2]):
-                    # 按导出空间的 x 镜像一起算，误差可接受
-                    xs.append(-corner_x)
-                    ys.append(corner_y)
-                    zs.append(corner_z)
+    for _, corners in world_cubes(project):
+        for x, y, z in corners:
+            xs.append(-x)
+            ys.append(y)
+            zs.append(z)
     if not xs:
         return 1.0, 1.0, 0.0
-    # +8 平移后取半径，参照 Blockbench calculateVisibleBox
-    radius = max(max(max(xs) + 8, max(zs) + 8), max(-min(xs) + 8, -min(zs) + 8))
+    radius = max(abs(v) for v in xs + zs) + 8
     width = max(1.0, math.ceil(radius * 2 / 16))
-    y_min = math.floor((min(ys) + 8) / 16)
-    y_max = math.ceil((max(ys) + 8) / 16)
+    y_min = math.floor((min(ys) - 1e-6) / 16)
+    y_max = math.ceil((max(ys) + 1e-6) / 16)
     height = max(1.0, float(y_max - y_min))
     center = (y_min + y_max) / 2.0
     return width, height, center
@@ -207,19 +207,23 @@ def _visible_box(project: BlockbenchProject) -> tuple[float, float, float]:
 def _compile_keyframe(channel: str, kf: Keyframe, keyframes: list[Keyframe]) -> Any:
     """按 keyframe.js compileBedrockKeyframe 语义导出单个关键帧。"""
     values = list(kf.values)
+    idx = keyframes.index(kf)
+    previous = keyframes[idx - 1] if idx > 0 else None
+    if kf.interpolation == "bezier":
+        raise ExportError("Bedrock/GeckoLib 暂不支持导出 Bezier 关键帧", "改用 linear/step/catmullrom，或先在 Blockbench 烘焙曲线")
     if kf.interpolation == "catmullrom":
-        idx = keyframes.index(kf)
-        previous = keyframes[idx - 1] if idx > 0 else None
         include_pre = (previous is None and kf.time > 0) or (previous is not None and previous.interpolation != "catmullrom")
-        pre = _flip(channel, values) if include_pre else None
-        post = _flip(channel, keyframes[idx + 1].values) if (not include_pre and idx + 1 < len(keyframes)) else _flip(channel, values)
-        return {"pre": pre, "post": post, "lerp_mode": "catmullrom"}
+        result = {"post": _flip(channel, values), "lerp_mode": "catmullrom"}
+        if include_pre:
+            result["pre"] = _flip(channel, values)
+        return result
+    if previous is not None and previous.interpolation == "step":
+        return {"pre": _flip(channel, previous.values), "post": _flip(channel, values)}
     if len(keyframes) == 1 and kf.interpolation != "catmullrom":
         value = _flip(channel, values)
         if channel == "scale" and len(set(value)) == 1:
             return value[0]
         return value
-    # 简单化：bezier 按线性处理，其余照常
     return _flip(channel, values)
 
 
@@ -263,8 +267,8 @@ def animation_json(project: BlockbenchProject) -> dict[str, Any]:
     return {"format_version": "1.8.0", "animations": animations}
 
 
-def export_geometry(project: BlockbenchProject, path: str) -> dict[str, Any]:
-    data = geometry_json(project)
+def export_geometry(project: BlockbenchProject, path: str, render_bounds: dict | None = None) -> dict[str, Any]:
+    data = geometry_json(project, render_bounds)
     _write_json(data, path)
     return {"path": path, "format_version": data["format_version"], "geometry": geometry_identifier(project)}
 
@@ -276,9 +280,12 @@ def export_animation(project: BlockbenchProject, path: str) -> dict[str, Any]:
     return {"path": path, "format_version": data["format_version"], "animations": names}
 
 
-def export_combined(project: BlockbenchProject, geo_path: str, anim_path: str | None) -> dict[str, Any]:
+def export_combined(project: BlockbenchProject, geo_path: str, anim_path: str | None, render_bounds: dict | None = None) -> dict[str, Any]:
     """几何体 + 动画（可选）一起导出，供 Bedrock 资源包使用。"""
-    geo = export_geometry(project, geo_path)
+    # Validate all animation semantics before writing any part of the resource pair.
+    if anim_path and project.animations:
+        animation_json(project)
+    geo = export_geometry(project, geo_path, render_bounds)
     anim_result = None
     if anim_path and project.animations:
         anim_result = export_animation(project, anim_path)

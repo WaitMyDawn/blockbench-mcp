@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import tempfile
 from typing import Any
 
 from ..document import (
@@ -20,6 +21,8 @@ from ..document import (
     Group,
     Keyframe,
     SUPPORTED_FORMATS,
+    finite_number,
+    _as_vec3,
     Texture,
     vec3_to_json,
 )
@@ -262,7 +265,7 @@ def project_from_dict(data: dict[str, Any], *, path: str | None = None) -> Block
     project.model_identifier = data.get("model_identifier") or ""
     vb = data.get("visible_box")
     if isinstance(vb, list) and len(vb) == 3:
-        project.visible_box = [float(x) for x in vb]
+        project.visible_box = _as_vec3(vb, "visible_box")
     project.credit = data.get("credit") or ""
     project.parent = data.get("parent") or ""
 
@@ -326,7 +329,7 @@ def project_from_dict(data: dict[str, Any], *, path: str | None = None) -> Block
             if len(uv) == 2:
                 uv = [uv[0], uv[1], uv[0], uv[1]]
             el.faces[key] = Face(
-                uv=[float(x) for x in uv[:4]],
+                uv=[finite_number(x, "uv") for x in uv[:4]],
                 texture=texture_uuid,
                 rotation=int((fraw or {}).get("rotation") or 0),
             )
@@ -338,8 +341,8 @@ def project_from_dict(data: dict[str, Any], *, path: str | None = None) -> Block
         g = Group(
             uuid=raw.get("uuid"),
             name=raw.get("name") or "group",
-            origin=[float(x) for x in (raw.get("origin") or [0, 0, 0])],
-            rotation=[float(x) for x in (raw.get("rotation") or [0, 0, 0])],
+            origin=_as_vec3(raw.get("origin") or [0, 0, 0], "origin"),
+            rotation=_as_vec3(raw.get("rotation") or [0, 0, 0], "rotation"),
             visibility=bool(raw.get("visibility", True)),
             export=bool(raw.get("export", True)),
             color=int(raw.get("color") or 0),
@@ -366,8 +369,8 @@ def project_from_dict(data: dict[str, Any], *, path: str | None = None) -> Block
                     target = Group(
                         uuid=uid,
                         name=node["name"],
-                        origin=[float(x) for x in (node.get("origin") or [0, 0, 0])],
-                        rotation=[float(x) for x in (node.get("rotation") or [0, 0, 0])],
+                        origin=_as_vec3(node.get("origin") or [0, 0, 0], "origin"),
+                        rotation=_as_vec3(node.get("rotation") or [0, 0, 0], "rotation"),
                         visibility=bool(node.get("visibility", True)),
                         export=bool(node.get("export", True)),
                         color=int(node.get("color") or 0),
@@ -418,15 +421,16 @@ def project_from_dict(data: dict[str, Any], *, path: str | None = None) -> Block
 
                 def num(v: Any) -> float:
                     try:
-                        return float(v)
+                        number = float(v)
                     except (TypeError, ValueError):
                         return 0.0
+                    return finite_number(number, "keyframe.values")
 
                 ator.keyframes.append(
                     Keyframe(
                         uuid=kf_raw.get("uuid"),
                         channel=kf_raw.get("channel") or "rotation",
-                        time=float(kf_raw.get("time") or 0.0),
+                        time=finite_number(kf_raw.get("time") or 0.0, "time", minimum=0),
                         values=[num(dp.get("x")), num(dp.get("y")), num(dp.get("z"))],
                         interpolation=kf_raw.get("interpolation") or "linear",
                     )
@@ -437,7 +441,7 @@ def project_from_dict(data: dict[str, Any], *, path: str | None = None) -> Block
 
 
 def dumps(project: BlockbenchProject) -> str:
-    return json.dumps(project_to_dict(project), ensure_ascii=False, indent=2)
+    return json.dumps(project_to_dict(project), ensure_ascii=False, indent=2, allow_nan=False)
 
 
 def loads(text: str) -> BlockbenchProject:
@@ -452,9 +456,22 @@ def read(path: str) -> BlockbenchProject:
         raise CodecError(f"无法读取文件 {path}", str(exc)) from exc
 
 
-def write(project: BlockbenchProject, path: str) -> None:
+def write(project: BlockbenchProject, path: str, *, sync_stamp: dict | None = None) -> None:
+    """Serialize first and atomically replace, so bridge readers never see a partial file."""
+    data = project_to_dict(project)
+    if sync_stamp is not None:
+        data["mcp_sync"] = sync_stamp
+    text = json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False)
+    temporary = None
     try:
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(dumps(project))
+        folder = os.path.dirname(os.path.abspath(path))
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n", dir=folder, delete=False) as fh:
+            temporary = fh.name
+            fh.write(text)
+        os.replace(temporary, path)
+        temporary = None
     except OSError as exc:
         raise CodecError(f"无法写入文件 {path}", str(exc)) from exc
+    finally:
+        if temporary is not None:
+            os.unlink(temporary)

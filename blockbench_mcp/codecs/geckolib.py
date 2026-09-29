@@ -45,6 +45,7 @@ def export_geckolib(
     modid: str = "mymod",
     category: str = "item",
     name: str | None = None,
+    render_bounds: dict | None = None,
 ) -> dict[str, Any]:
     """按 GeckoLib 资源布局导出模型/动画/纹理。"""
     if not modid or not modid.strip():
@@ -53,15 +54,18 @@ def export_geckolib(
     if not model_name:
         raise ExportError("模型名称不能为空", "请给项目命名或传 name 参数")
 
+    # Preflight before touching any output files (e.g. unsupported Bezier tracks).
+    geometry = bedrock.geometry_json(project, render_bounds)
+    animation = bedrock.animation_json(project) if project.animations else None
     written: list[str] = []
     geo_path = os.path.join(output_dir, "assets", modid, "geo", category, f"{model_name}.geo.json")
-    _write_json(bedrock.geometry_json(project), geo_path)
+    _write_json(geometry, geo_path)
     written.append(geo_path)
 
     anim_path = None
     if project.animations:
         anim_path = os.path.join(output_dir, "assets", modid, "animations", category, f"{model_name}.animation.json")
-        _write_json(bedrock.animation_json(project), anim_path)
+        _write_json(animation, anim_path)
         written.append(anim_path)
 
     textures: dict[str, str] = {}
@@ -101,4 +105,3 @@ def export_geckolib(
         "animations": [a.name for a in project.animations],
         "note": "模组代码中的 GeoModel 路径示例：geo/xxx.geo.json、animations/xxx.animation.json",
     }
-

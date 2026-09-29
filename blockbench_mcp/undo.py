@@ -15,7 +15,9 @@
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from threading import RLock
 from typing import Any
 
 from .document import BlockbenchProject
@@ -40,6 +42,8 @@ class DocUndoRecord:
     before: Any = None
     after: Any = None
     label: str = ""
+    pixel_before: Any = None
+    pixel_after: Any = None
 
 
 class UndoManager:
@@ -49,6 +53,48 @@ class UndoManager:
         self.pixel_redo: list[PixelUndoRecord] = []
         self.doc_undo: list[DocUndoRecord] = []
         self.doc_redo: list[DocUndoRecord] = []
+        self._editing = False
+        self._lock = RLock()
+
+    def _pixel_state(self):
+        return (list(self.pixel_undo), list(self.pixel_redo))
+
+    def _restore_pixel_state(self, state):
+        if state is not None:
+            self.pixel_undo, self.pixel_redo = list(state[0]), list(state[1])
+
+    @contextmanager
+    def transaction(self, project: BlockbenchProject, label: str):
+        """One mutation = one undo step. Exceptions restore document and history."""
+        with self._lock:
+            self.reset_if_project_changed(project)
+            if self._editing:
+                raise StateError("不支持嵌套编辑事务")
+            before = copy.deepcopy(project)
+            pixel_before = self._pixel_state()
+            state = {"changed": False}
+            self._editing = True
+            try:
+                yield state
+                after = copy.deepcopy(project)
+                state["changed"] = before.__dict__ != after.__dict__
+                if state["changed"]:
+                    # Replacing/removing bitmap sources invalidates old pixel-only history.
+                    texture_state = lambda p: [(t.uuid, t.width, t.height, t.source_data, t.source_path) for t in p.textures]
+                    if texture_state(before) != texture_state(after) and self._pixel_state() == pixel_before:
+                        self.pixel_undo.clear()
+                        self.pixel_redo.clear()
+                    self.doc_undo.append(DocUndoRecord(before, after, label, pixel_before, self._pixel_state()))
+                    self.doc_undo = self.doc_undo[-DOC_LIMIT:]
+                    self.doc_redo.clear()
+                else:
+                    self._restore_pixel_state(pixel_before)
+            except Exception:
+                self._restore_doc_snapshot(project, before)
+                self._restore_pixel_state(pixel_before)
+                raise
+            finally:
+                self._editing = False
 
     # ---------- 项目切换保护 ----------
     def reset_if_project_changed(self, project: BlockbenchProject) -> bool:
@@ -82,8 +128,8 @@ class UndoManager:
         textures: 当前（操作后）的纹理对象列表，用于校验受影响集合。
         doc_before: 操作前 deepcopy(project)；不传则回退到当前状态（等价于无文档级回退）。
         """
-        if self.reset_if_project_changed(project):
-            return  # 项目刚切换：此操作即为新文档的第一笔，无旧状态可回退
+        self.reset_if_project_changed(project)
+        pixel_before = self._pixel_state()
         record = PixelUndoRecord(label=label)
         for tex in textures:
             record.textures[tex.uuid] = (before.get(tex.uuid, tex.source_data or ""), tex.source_data or "")
@@ -91,9 +137,12 @@ class UndoManager:
             self.pixel_undo.append(record)
             self.pixel_undo = self.pixel_undo[-PIXEL_LIMIT:]
             self.pixel_redo.clear()
+        if self._editing:
+            return  # The outer transaction owns the document snapshot and rollback.
         snapshot_before = doc_before if doc_before is not None else copy.deepcopy(project)
         snapshot_after = copy.deepcopy(project)  # 此时为操作后状态
-        doc = DocUndoRecord(before=snapshot_before, after=snapshot_after, label=label)
+        doc = DocUndoRecord(before=snapshot_before, after=snapshot_after, label=label,
+                            pixel_before=pixel_before, pixel_after=self._pixel_state())
         self.doc_undo.append(doc)
         self.doc_undo = self.doc_undo[-DOC_LIMIT:]
         self.doc_redo.clear()
@@ -114,24 +163,11 @@ class UndoManager:
         return restored
 
     def _restore_doc_snapshot(self, project: BlockbenchProject, snap: BlockbenchProject) -> bool:
-        try:
-            project.name = snap.name
-            project.texture_width = snap.texture_width
-            project.texture_height = snap.texture_height
-            project.box_uv = snap.box_uv
-            project.model_identifier = snap.model_identifier
-            project.elements = snap.elements
-            project.groups = snap.groups
-            project.textures = snap.textures
-            project.animations = snap.animations
-            project.root_children = snap.root_children
-            project.extra_root_fields = copy.deepcopy(snap.extra_root_fields)
-            project.visible_box = list(snap.visible_box)
-            project.parent = snap.parent
-            project.credit = snap.credit
-            return True
-        except Exception:  # noqa: BLE001 - 快照恢复失败视为不可用
-            return False
+        # Never alias a historical snapshot: editing after undo must not corrupt history.
+        restored = copy.deepcopy(snap.__dict__)
+        project.__dict__.clear()
+        project.__dict__.update(restored)
+        return True
 
     # ---------- 像素级 undo / redo ----------
     def pixel_undo_once(self, project: BlockbenchProject) -> dict[str, Any]:
@@ -166,7 +202,8 @@ class UndoManager:
         record = self.doc_undo.pop()
         if not self._restore_doc_snapshot(project, record.before):
             raise StateError("文档快照恢复失败")
-        self.doc_redo.append(DocUndoRecord(before=record.before, after=record.after, label=record.label))
+        self._restore_pixel_state(record.pixel_before)
+        self.doc_redo.append(record)
         return {"label": record.label}
 
     def doc_redo_once(self, project: BlockbenchProject) -> dict[str, Any]:
@@ -176,6 +213,7 @@ class UndoManager:
         record = self.doc_redo.pop()
         if not self._restore_doc_snapshot(project, record.after):
             raise StateError("文档快照恢复失败")
+        self._restore_pixel_state(record.pixel_after)
         self.doc_undo.append(record)
         return {"label": record.label}
 

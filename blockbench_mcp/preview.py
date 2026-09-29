@@ -5,7 +5,7 @@
 画质目标是“形状验收”，不是最终材质效果。
 
 渲染约定（与 Blockbench/Minecraft 一致的近似）：
-* Y 轴向上；骨骼/元素旋转按 ZXY 顺序作用于各自的轴心 origin
+* Y 轴向上；骨骼/元素旋转采用 Blockbench 默认 ZYX 欧拉顺序，子变换先于父变换
 * 正交相机：yaw 绕 Y、pitch 绕 X；painter 算法按面深度从远到近绘制
 """
 
@@ -17,59 +17,21 @@ import zlib
 from dataclasses import dataclass
 from typing import Any
 
-from .document import BlockbenchProject, Element, Group
+from .document import BlockbenchProject, Element
 from . import images as images_lib
+from .geometry import rotate_point, world_cubes
 
 Vec = list[float]
 
 
-def _rot_zxy(rot: Vec, p: Vec) -> Vec:
-    """按 ZXY 顺序旋转点 p（近似 Blockbench Minecraft 格式的欧拉顺序）。"""
-    rx, ry, rz = (math.radians(x) for x in rot)
-    x, y, z = p
-    # Z
-    x, y = x * math.cos(rz) - y * math.sin(rz), x * math.sin(rz) + y * math.cos(rz)
-    # X
-    y, z = y * math.cos(rx) - z * math.sin(rx), y * math.sin(rx) + z * math.cos(rx)
-    # Y
-    x, z = x * math.cos(ry) + z * math.sin(ry), -x * math.sin(ry) + z * math.cos(ry)
-    return [x, y, z]
-
-
 def _pivot_rotate(origin: Vec, rotation: Vec, p: Vec) -> Vec:
     """绕轴心旋转：T(origin) * R * T(-origin)。"""
-    local = [p[i] - origin[i] for i in range(3)]
-    rotated = _rot_zxy(rotation, local)
-    return [rotated[i] + origin[i] for i in range(3)]
+    return rotate_point(origin, rotation, p)
 
 
 def _collect_cubes(project: BlockbenchProject) -> list[tuple[Element, list[Vec]]]:
     """沿骨骼树收集立方体及每个角点的世界坐标。"""
-    results: list[tuple[Element, list[Vec]]] = []
-
-    def walk(uids: list[str], parent_transforms: list[tuple[Vec, Vec]]) -> None:
-        for uid in uids:
-            g: Group | None = project.find_group_by_uuid(uid)
-            if g is not None:
-                walk(g.children, parent_transforms + [(g.origin, g.rotation)])
-                continue
-            el = project.find_element_by_uuid(uid)
-            if el is None or not el.export:
-                continue
-            corners: list[Vec] = []
-            for cx in (el.from_[0], el.to[0]):
-                for cy in (el.from_[1], el.to[1]):
-                    for cz in (el.from_[2], el.to[2]):
-                        p: Vec = [cx, cy, cz]
-                        if any(abs(v) > 1e-9 for v in el.rotation):
-                            p = _pivot_rotate(el.origin, el.rotation, p)
-                        for origin, rotation in parent_transforms:
-                            p = _pivot_rotate(origin, rotation, p)
-                        corners.append(p)
-            results.append((el, corners))
-
-    walk(project.root_children, [])
-    return results
+    return world_cubes(project)
 
 
 _FACES: list[tuple[str, tuple[int, int, int, int]]] = [
@@ -163,36 +125,11 @@ def ascii_views(project: BlockbenchProject, cells: int = 36) -> dict[str, list[s
     Y 向上；不同部件用不同字母（首字符），便于读结构。
     """
 
-    def world_aabb(el: Element, transforms: list[tuple[Vec, Vec]]) -> tuple[Vec, Vec]:
-        pts: list[Vec] = []
-        for cx in (el.from_[0], el.to[0]):
-            for cy in (el.from_[1], el.to[1]):
-                for cz in (el.from_[2], el.to[2]):
-                    p: Vec = [cx, cy, cz]
-                    if any(abs(v) > 1e-9 for v in el.rotation):
-                        p = _pivot_rotate(el.origin, el.rotation, p)
-                    for origin, rotation in transforms:
-                        p = _pivot_rotate(origin, rotation, p)
-                    pts.append(p)
-        return (
-            [min(p[i] for p in pts) for i in range(3)],
-            [max(p[i] for p in pts) for i in range(3)],
-        )
-
     items: list[tuple[str, Vec, Vec]] = []
-
-    def walk(uids: list[str], transforms: list[tuple[Vec, Vec]]) -> None:
-        for uid in uids:
-            g = project.find_group_by_uuid(uid)
-            if g is not None:
-                walk(g.children, transforms + [(g.origin, g.rotation)])
-                continue
-            el = project.find_element_by_uuid(uid)
-            if el and el.export:
-                lo, hi = world_aabb(el, transforms)
-                items.append((el.name[:1].upper() or "#", lo, hi))
-
-    walk(project.root_children, [])
+    for el, pts in world_cubes(project):
+        lo = [min(p[i] for p in pts) for i in range(3)]
+        hi = [max(p[i] for p in pts) for i in range(3)]
+        items.append((el.name[:1].upper() or "#", lo, hi))
     if not items:
         return {"front": ["(空模型)"], "side": ["(空模型)"], "top": ["(空模型)"]}
 
@@ -275,12 +212,20 @@ def render_png(
     else:
         scale, cx, cy = 1.0, 0.0, 0.0
 
-    def to_screen(p: tuple[float, float]) -> tuple[float, float]:
-        return ((p[0] - cx) * scale + width / 2, (p[1] - cy) * scale + height / 2)
-
     # ---- 超采样光栅化：先渲染 s 倍画布，再降采样得到抗锯齿效果
     s = max(1, int(supersample))
     w, h = width * s, height * s
+
+    def to_screen(p: tuple[float, float]) -> tuple[float, float]:
+        """视图坐标 → 超采样缓冲区像素坐标。
+
+        两个必须对齐的点：
+        * 视图空间 Y 轴向上，而像素行号向下，所以 Y 取负（否则画面上下颠倒）；
+        * 投影结果必须落在 s 倍缓冲区上，缩放与画布中心都要乘 s
+          （否则模型只画在左上角 1/s 大小，降采样后整体缩小）。
+        """
+        return ((p[0] - cx) * scale * s + w / 2, -(p[1] - cy) * scale * s + h / 2)
+
     buf: list[bytearray] = [bytearray([255, 255, 255]) * w for _ in range(h)]
 
     def fill_polygon(poly_screen: list[tuple[float, float]], color: tuple[int, int, int]) -> None:

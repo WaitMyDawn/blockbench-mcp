@@ -7,10 +7,10 @@
 from __future__ import annotations
 
 import base64
-import copy
 import os
 import struct
 import zlib
+from functools import wraps
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP, Image
@@ -22,16 +22,17 @@ from .codecs import bedrock as bedrock_codec
 from .codecs import geckolib as geckolib_codec
 from .codecs import java as java_codec
 from . import examples as examples_lib
-from .document import FACE_KEYS, BlockbenchProject, Face, Texture
+from .document import FACE_KEYS, BlockbenchProject, Face, Texture, finite_number, new_uuid
 from .errors import BBError
 from . import images as images_lib
 from . import paint as paint_lib
 from . import preview as preview_renderer
 from . import quality as quality_checker
+from . import animation_analysis
 from .result import ok
 from .session import session
 from . import undo as undo_lib
-from .drivers.remote import RemoteDriver
+from .drivers.remote import RemoteDriver, ensure_blockbench_running, same_path
 
 mcp = FastMCP(
     "blockbench-mcp",
@@ -40,6 +41,8 @@ mcp = FastMCP(
         "bone_create → cube_create → texture_create → texture_assign → animation_create "
         "→ keyframe_add → export_model。所有修改只作用于内存，需 project_save 或 "
         "export_model 落盘；Blockbench 可直接打开保存的 .bbmodel。"
+        "参数化建模（几十上百个方块）优先用 cubes_create_bulk，一次调用建一批，"
+        "比逐个 cube_create 少上千次往返。"
     ),
 )
 
@@ -48,8 +51,46 @@ def _err(exc: BBError) -> ToolError:
     return ToolError(str(exc))
 
 
+def _tool_error(message: str, hint: str | None = None) -> ToolError:
+    """构造带「建议」的 ToolError。
+
+    注意：FastMCP 的 ToolError 只接受一个参数，``ToolError("msg", "hint")`` 虽然不报错，
+    但 ``str()`` 会变成 ``('msg', 'hint')`` 这种元组字符串，提示就废掉了——
+    带建议的错误必须走这个 helper 把它拼进消息里。
+    """
+    return ToolError(f"{message}（建议：{hint}）" if hint else message)
+
+
 def _project() -> BlockbenchProject:
     return session.require_project()
+
+
+def _edit(fn):
+    """Register edits as atomic, undoable document transactions."""
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        project = _project()
+        dirty = session.dirty
+        try:
+            with undo_lib.manager.transaction(project, fn.__name__) as state:
+                result = fn(*args, **kwargs)
+        except BBError as exc:
+            session.dirty = dirty
+            raise _err(exc) from exc
+        except Exception:
+            session.dirty = dirty
+            raise
+        if state["changed"]:
+            session.edited()
+        else:
+            session.dirty = dirty
+        block = result[0] if isinstance(result, list) else result
+        if isinstance(block, dict) and isinstance(block.get("data"), dict):
+            block["data"]["revision"] = session.revision
+            if "undo" in block["data"]:
+                block["data"]["undo"] = undo_lib.manager.status(project)
+        return result
+    return wrapped
 
 
 def _name_or_uuid_guard(value: Any, label: str) -> str:
@@ -163,6 +204,7 @@ def project_create(
     )
     project.model_identifier = model_identifier
     session.project = project
+    session.new_identity()
     session.save_path = None
     session.dirty = False
     undo_lib.manager.reset_if_project_changed(project)
@@ -176,6 +218,7 @@ def project_open(path: str) -> dict[str, Any]:
     except BBError as exc:
         raise _err(exc) from exc
     session.project = project
+    session.new_identity()
     session.save_path = path
     session.dirty = False
     undo_lib.manager.reset_if_project_changed(project)
@@ -192,10 +235,49 @@ def project_save(path: str | None = None) -> dict[str, Any]:
     target = path or session.save_path
     if not target:
         raise ToolError("没有可保存的路径", "传入 path，例如 C:/models/my_model.bbmodel")
-    bbmodel_codec.write(project, target)
+    token = new_uuid()
+    bbmodel_codec.write(project, target, sync_stamp={
+        "project_id": session.project_id, "revision": session.revision, "source_token": token,
+    })
     session.save_path = target
     session.dirty = False
-    return ok("project_save", {"path": target, "project": project.summary()})
+    session.source_token = token
+    return ok("project_save", {"path": target, "project": project.summary(), "revision": session.revision, "source_token": token})
+
+
+@mcp.tool(description="保存内存工程并可靠同步到 Blockbench，等待工程/纹理/视口就绪，返回实际加载的 project_id/revision/source_token。默认保护视口未保存修改；replace_unsaved=True 才允许替换。插件桥须已运行。")
+def project_sync(path: str | None = None, replace_unsaved: bool = False, wait_seconds: float = 10.0,
+                 expected_revision: int | None = None) -> dict[str, Any]:
+    _project()
+    target = path or session.save_path
+    if not target:
+        raise _tool_error("没有同步路径", "传入 .bbmodel 的保存路径")
+    wait = finite_number(wait_seconds, "wait_seconds", minimum=0.1)
+    if wait > 30:
+        raise _tool_error("wait_seconds 最大为 30 秒")
+    if expected_revision is not None and expected_revision != session.revision:
+        raise _tool_error(f"工程版本已改变：期望 {expected_revision}，实际 {session.revision}")
+    driver = RemoteDriver(timeout=wait + 7)
+    try:
+        health = driver.health()
+        if "methods" in health and "capture" not in health["methods"]:
+            raise _tool_error("project_sync 需要插件桥 0.5.0 或更新版本", "更新并热重载 plugin/blockbench_mcp_bridge.js")
+        projects = health.get("projects", [health])
+        if any(same_path(p.get("save_path"), target) and p.get("saved") is False for p in projects) and not replace_unsaved:
+            raise _tool_error("Blockbench 同路径工程有未保存修改，未进行同步", "先保存视口修改，或明确传 replace_unsaved=True")
+        project_save(target)
+        payload = driver.command("open", {
+            "path": os.path.abspath(target), "replace_unsaved": replace_unsaved,
+            "ready_timeout_ms": int(wait * 1000), "expect_source_token": session.source_token,
+            "expect_project_id": session.project_id, "expect_revision": session.revision,
+        })
+    except BBError as exc:
+        raise _err(exc) from exc
+    if (not payload.get("ok") or payload.get("source_token") != session.source_token
+            or payload.get("revision") != session.revision or payload.get("project_id") != session.project_id):
+        raise _tool_error(f"工程同步未确认：{payload.get('error') or payload}")
+    session.synced_revision = session.revision
+    return ok("project_sync", {"path": target, "viewport": payload, "revision": session.revision})
 
 
 @mcp.tool(description="查看当前项目状态：格式、纹理尺寸、各类对象数量。")
@@ -207,6 +289,9 @@ def project_status() -> dict[str, Any]:
             "project": project.summary(),
             "save_path": session.save_path,
             "dirty": session.dirty,
+            "project_id": session.project_id,
+            "revision": session.revision,
+            "synced_revision": session.synced_revision,
             "outline": project.outline_tree(),
         },
     )
@@ -227,6 +312,7 @@ def project_outline() -> dict[str, Any]:
         "source_path 指向磁盘 PNG 时内嵌该文件。没有 color/source_path 时只登记元数据。"
     )
 )
+@_edit
 def texture_create(
     name: str,
     width: int = 16,
@@ -283,6 +369,7 @@ def texture_list() -> dict[str, Any]:
         "texture 传纹理 uuid 或名称。"
     )
 )
+@_edit
 def texture_assign(
     element: str,
     texture: str,
@@ -299,6 +386,8 @@ def texture_assign(
         targets = faces
     applied = []
     for key in targets:
+        if key not in FACE_KEYS:
+            raise _tool_error(f"未知面 {key!r}", f"可用面：{', '.join(FACE_KEYS)}")
         if key not in el.faces:
             # 缺省把整张画布贴到该面（像素坐标，与 Blockbench 约定一致）
             el.faces[key] = Face(uv=[0.0, 0.0, float(tex.width), float(tex.height)], texture=tex.uuid)
@@ -315,6 +404,7 @@ def texture_assign(
         "两者都不传则只改元数据；clear_source=True 清除内嵌位图。"
     )
 )
+@_edit
 def texture_update(
     texture: str,
     name: str | None = None,
@@ -367,6 +457,7 @@ def texture_update(
         "注意：被引用的面会变为未贴图，删除前先用 texture_list/quality 确认。"
     )
 )
+@_edit
 def texture_delete(texture: str) -> dict[str, Any]:
     project = _project()
     tex = project.remove_texture(texture)
@@ -410,6 +501,7 @@ def texture_export(texture: str, path: str) -> dict[str, Any]:
         "texture 缺省时自动使用第一张纹理（非 box_uv 项目）。faces 可精确指定每个面的 UV。"
     )
 )
+@_edit
 def cube_create(
     name: str,
     from_: list[float],
@@ -442,11 +534,85 @@ def cube_create(
 
 @mcp.tool(
     description=(
+        "批量创建立方体：一次 MCP 调用建 N 个，用于参数化/脚本化建模。"
+        "cubes 是对象数组，每项字段与 cube_create 完全一致："
+        "name / from_（也接受 from）/ to / parent / origin / rotation / uv_offset / texture / faces。"
+        "stop_on_error=True 时遇到第一个坏项就停下，False 则跳过坏项继续建。"
+        "返回 created（每项 index/uuid/name，include_info=True 时给完整 element_info）、"
+        "failures（index/name/error）与 total_elements。"
+        "atomic=True 时任意失败会回滚整批；默认保留成功项。整批只占一次撤销记录。"
+        "把上千个立方体的构建从上千次往返压成一次，是这类程序化建模的主要提速手段。"
+    )
+)
+@_edit
+def cubes_create_bulk(
+    cubes: list[dict[str, Any]],
+    stop_on_error: bool = True,
+    include_info: bool = False,
+    atomic: bool = False,
+) -> dict[str, Any]:
+    project = _project()
+    if not isinstance(cubes, list) or not cubes:
+        raise ToolError("cubes 必须是非空数组")
+
+    created: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    for index, spec in enumerate(cubes):
+        if not isinstance(spec, dict):
+            failures.append({"index": index, "name": None, "error": "每项必须是对象"})
+            if stop_on_error:
+                break
+            continue
+        name = str(spec.get("name") or f"cube_{index}")
+        try:
+            el = project.add_element(
+                name=name,
+                from_=spec.get("from_", spec.get("from")),
+                to=spec.get("to"),
+                parent=spec.get("parent"),
+                origin=spec.get("origin"),
+                rotation=spec.get("rotation"),
+                uv_offset=spec.get("uv_offset"),
+                texture=spec.get("texture"),
+                faces=spec.get("faces"),
+            )
+        except (BBError, KeyError, TypeError, ValueError) as exc:
+            # 单点失败要能定位到第几项，否则批量接口没法用
+            failures.append({"index": index, "name": name, "error": str(exc)})
+            if stop_on_error:
+                break
+            continue
+        created.append(
+            {"index": index, "element": project.element_info(el)}
+            if include_info
+            else {"index": index, "uuid": el.uuid, "name": el.name}
+        )
+
+    session.dirty = True
+    if atomic and failures:
+        raise _tool_error(f"批量创建已回滚：index={failures[0]['index']}，{failures[0]['error']}")
+    warnings = [f"{len(failures)} 个立方体创建失败，详见 failures"] if failures else None
+    return ok(
+        "cubes_create_bulk",
+        {
+            "created": created,
+            "created_count": len(created),
+            "failed_count": len(failures),
+            "failures": failures,
+            "total_elements": len(project.elements),
+        },
+        warnings=warnings,
+    )
+
+
+@mcp.tool(
+    description=(
         "修改立方体属性（部分更新）。改名/改包围盒(需同时给 from 与 to)/改轴心/改旋转/改 UV 偏移；"
         "faces 可整体替换逐面 UV（{face:{uv:[x1,y1,x2,y2]}} 或 {uv:{uv,uv_size}}），"
         "texture 可单独给该立方体所有面换纹理。"
     )
 )
+@_edit
 def cube_update(
     cube: str,
     name: str | None = None,
@@ -478,6 +644,7 @@ def cube_update(
 
 
 @mcp.tool(description="删除立方体（只删该元素，不删父骨骼）。")
+@_edit
 def cube_delete(cube: str) -> dict[str, Any]:
     project = _project()
     try:
@@ -497,6 +664,7 @@ def cube_delete(cube: str) -> dict[str, Any]:
         "parent 可嵌套（子骨骼跟随父骨骼）。"
     )
 )
+@_edit
 def bone_create(
     name: str,
     parent: str | None = None,
@@ -518,6 +686,7 @@ def bone_create(
         "改名会同步更新已有动画里的骨骼名。"
     )
 )
+@_edit
 def bone_update(
     bone: str,
     name: str | None = None,
@@ -540,6 +709,7 @@ def bone_update(
         "相关动画 animator 也会被清理。返回删除数量。"
     )
 )
+@_edit
 def bone_delete(bone: str) -> dict[str, Any]:
     project = _project()
     try:
@@ -559,6 +729,7 @@ def bone_delete(bone: str) -> dict[str, Any]:
         "添加关键帧时会自动延长；override=True 导出时写 override_previous_animation。"
     )
 )
+@_edit
 def animation_create(
     name: str,
     length: float = 1.0,
@@ -583,6 +754,7 @@ def animation_create(
         "interpolation: linear/step/bezier/catmullrom。同一骨骼同一通道同一时间会覆盖旧帧。"
     )
 )
+@_edit
 def keyframe_add(
     animation: str,
     bone: str,
@@ -644,7 +816,28 @@ def keyframe_list(animation: str | None = None) -> dict[str, Any]:
     return ok("keyframe_list", {"animations": data})
 
 
+@mcp.tool(description="批量添加关键帧，一次事务与撤销记录。每项字段同 keyframe_add；任意失败回滚整批并返回失败 index。适合密集动画，避免逐帧调用与快照开销。")
+@_edit
+def keyframes_add_bulk(keyframes: list[dict[str, Any]], include_ids: bool = False) -> dict[str, Any]:
+    project = _project()
+    if not keyframes:
+        raise _tool_error("keyframes 必须是非空数组")
+    created = []
+    for index, spec in enumerate(keyframes):
+        try:
+            kf = project.add_keyframe(
+                spec["animation"], spec["bone"], spec["channel"], spec["time"], spec["values"],
+                interpolation=spec.get("interpolation", "linear"),
+            )
+        except (BBError, KeyError, TypeError, ValueError) as exc:
+            raise _tool_error(f"关键帧批量编辑已回滚：index={index}，{exc}") from exc
+        if include_ids:
+            created.append({"index": index, "uuid": kf.uuid})
+    return ok("keyframes_add_bulk", {"created_count": len(keyframes), "created": created})
+
+
 @mcp.tool(description="删除一个关键帧（按骨骼/通道/时间定位）。")
+@_edit
 def keyframe_remove(
     animation: str,
     bone: str,
@@ -691,12 +884,12 @@ def _face_uv_rect(
         "shadow 额外：blur(像素), offset:[dx,dy], strength(0~1)。一次调用=一个 undo 事务。"
     )
 )
+@_edit
 def texture_paint(
     ops: list[dict[str, Any]],
     texture: str | None = None,
 ) -> Any:
     project = _project()
-    doc_before = copy.deepcopy(project)
     targets: list[tuple[Texture, PILImage.Image]] = []
     if texture is not None:
         tex = project.texture(texture)
@@ -708,11 +901,11 @@ def texture_paint(
     if not ops:
         raise ToolError("ops 不能为空", "至少给一条 {kind:'fill', color:'#...'}")
     summary: list[dict[str, Any]] = []
-    before = {t.uuid: t.source_data or "" for t, _ in targets}
+    before = {t.uuid: t.source_data or paint_lib.encode_canvas(image) for t, image in targets}
     for tex, image in targets:
         results = paint_lib.apply_ops(image, ops)
         summary.append({"texture": tex.name, "ops": results})
-    changed = _commit_texture_edits(project, targets, label="texture_paint", before=before, doc_before=doc_before)
+    changed = _commit_texture_edits(project, targets, label="texture_paint", before=before)
     data = ok(
         "texture_paint",
         {"changed": changed, "ops_summary": summary, "undo": undo_lib.manager.status(project)},
@@ -729,6 +922,7 @@ def texture_paint(
         "ops 格式与 texture_paint 相同；不写 region 时自动使用该面的 UV 矩形。"
     )
 )
+@_edit
 def texture_paint_face(
     element: str,
     face: str,
@@ -737,14 +931,13 @@ def texture_paint_face(
     shrink: int = 0,
 ) -> Any:
     project = _project()
-    doc_before = copy.deepcopy(project)
     tex, _, uv = _face_uv_rect(project, element, face)
     if texture is not None:
         chosen = project.texture(texture)
         if chosen.uuid != tex.uuid:
             raise ToolError(f"面 {element}/{face} 使用纹理 {tex.name}，与传入 {chosen.name} 不一致")
     image = paint_lib.load_canvas(tex)
-    before = {tex.uuid: tex.source_data or ""}
+    before = {tex.uuid: tex.source_data or paint_lib.encode_canvas(image)}
     pad = max(0, int(shrink))
     box = paint_lib.clamp_box(
         image.width,
@@ -768,7 +961,6 @@ def texture_paint_face(
         [(tex, image)],
         label=f"paint_face:{element}/{face}",
         before=before,
-        doc_before=doc_before,
     )
     data = ok(
         "texture_paint_face",
@@ -794,6 +986,7 @@ def texture_paint_face(
         "element 为 cube 名/uuid；blend 默认 set。返回受影响面积与缩略图。"
     )
 )
+@_edit
 def texture_paint_cube(
     element: str,
     side: str | dict[str, Any],
@@ -802,7 +995,6 @@ def texture_paint_cube(
     blend: str = "set",
 ) -> Any:
     project = _project()
-    doc_before = copy.deepcopy(project)
     el = project.element(element)
     if not el.faces:
         raise ToolError(f"立方体 {el.name} 没有面部 UV", "先用 texture_assign 或 cube_update 设 UV")
@@ -827,7 +1019,7 @@ def texture_paint_cube(
             if isinstance(v, dict) else {"kind": "fill", "color": v, "blend": blend}
         )
 
-    before = {t.uuid: t.source_data or "" for t, _ in tex_map.values()}
+    before = {t.uuid: t.source_data or paint_lib.encode_canvas(image) for t, image in tex_map.values()}
     results = []
     assign = {"east": side, "north": side, "west": side, "south": side, "up": top, "down": bottom}
     for face_key, col in assign.items():
@@ -841,16 +1033,12 @@ def texture_paint_cube(
         box = paint_lib.clamp_box(image.width, image.height, *[float(v) for v in f.uv])
         if box is None:
             continue
-        try:
-            results.append(paint_lib.apply_op(image, box, paint_lib._parse_op(base_color(col))))
-        except Exception:  # noqa: BLE001 - 单面失败不中断其它面
-            continue
+        results.append(paint_lib.apply_op(image, box, paint_lib._parse_op(base_color(col))))
     changed = _commit_texture_edits(
         project,
         list(tex_map.values()),
         label=f"paint_cube:{el.name}",
         before=before,
-        doc_before=doc_before,
     )
     data = ok(
         "texture_paint_cube",
@@ -960,6 +1148,7 @@ def texture_validate_uv() -> dict[str, Any]:
         "仅影响纹理像素；结构性误操作请用 project_undo。"
     )
 )
+@_edit
 def texture_undo() -> dict[str, Any]:
     project = _project()
     try:
@@ -971,6 +1160,7 @@ def texture_undo() -> dict[str, Any]:
 
 
 @mcp.tool(description="重做一次被 texture_undo 撤销的纹理绘制。")
+@_edit
 def texture_redo() -> dict[str, Any]:
     project = _project()
     try:
@@ -993,7 +1183,7 @@ def project_undo() -> dict[str, Any]:
         result = undo_lib.manager.doc_undo_once(project)
     except BBError as exc:
         raise _err(exc) from exc
-    session.dirty = True
+    session.edited()
     return ok("project_undo", {**result, "undo": undo_lib.manager.status(project)})
 
 
@@ -1004,7 +1194,7 @@ def project_redo() -> dict[str, Any]:
         result = undo_lib.manager.doc_redo_once(project)
     except BBError as exc:
         raise _err(exc) from exc
-    session.dirty = True
+    session.edited()
     return ok("project_redo", {**result, "undo": undo_lib.manager.status(project)})
 
 
@@ -1032,6 +1222,7 @@ def undo_clear() -> dict[str, Any]:
         "resource_root 控制纹理资源根，如 minecraft:item）/ cem（OptiFine JEM）/ "
         "geckolib（Java 模组 GeckoLib：按 assets/<modid>/geo/... 布局写模型+动画+纹理）。"
         "path 传文件路径；bedrock 也可传目录自动命名。"
+        "bounds_mode=animated 时用原生动画采样计算动态可见范围（需 project_sync 与桥接 0.6.0）；sample_rate 控制频率，bounds_margin 为模型单位余量。默认 static。"
     )
 )
 def export_model(
@@ -1041,10 +1232,19 @@ def export_model(
     modid: str = "mymod",
     category: str = "item",
     model_name: str | None = None,
+    bounds_mode: str = "static",
+    sample_rate: float = 12,
+    bounds_margin: float = 16,
 ) -> dict[str, Any]:
     project = _project()
     target = target.lower()
     try:
+        if bounds_mode not in ("static", "animated"):
+            raise _tool_error("bounds_mode 必须为 static 或 animated")
+        if bounds_mode == "animated" and target not in ("bedrock", "geckolib"):
+            raise _tool_error("animated bounds 只适用于 bedrock/geckolib")
+        bounds_report = animation_analysis.review_native(project, sample_rate=sample_rate, margin=bounds_margin) if bounds_mode == "animated" else None
+        render_bounds = bounds_report["render_bounds"] if bounds_report else None
         if target == "bbmodel":
             bbmodel_codec.write(project, path)
             result = {"path": path, "format": "bbmodel"}
@@ -1053,13 +1253,13 @@ def export_model(
                 base = os.path.join(path, (project.model_identifier or project.name).removeprefix("geometry.") or "model")
                 geo_path = base + ".geo.json"
                 anim_path = base + ".animation.json"
-                data = bedrock_codec.export_combined(project, geo_path, anim_path if project.animations else None)
+                data = bedrock_codec.export_combined(project, geo_path, anim_path if project.animations else None, render_bounds)
                 result = data
             else:
                 anim_path = None
                 if project.animations:
                     anim_path = os.path.splitext(path)[0] + ".animation.json"
-                result = bedrock_codec.export_combined(project, path, anim_path)
+                result = bedrock_codec.export_combined(project, path, anim_path, render_bounds)
         elif target in ("java_block", "java"):
             result = java_codec.export_java_block(project, path, resource_root=resource_root)
         elif target in ("cem", "optifine_entity", "jem"):
@@ -1071,6 +1271,7 @@ def export_model(
                 modid=modid,
                 category=category,
                 name=model_name,
+                render_bounds=render_bounds,
             )
         else:
             raise ToolError(
@@ -1081,6 +1282,8 @@ def export_model(
         raise _err(exc) from exc
     except OSError as exc:
         raise ToolError(f"导出失败：{exc}") from exc
+    if bounds_report:
+        result["animated_bounds"] = {k: bounds_report[k] for k in ("sample_count", "sample_rate", "bounds", "render_bounds", "bounds_margin", "limitations")}
     session.dirty = False if target == "bbmodel" and path == session.save_path else session.dirty
     return ok("export_model", result)
 
@@ -1106,6 +1309,7 @@ def project_load_example(
             f"可用：{', '.join(examples_lib.available_ids())}",
         ) from exc
     session.project = project
+    session.new_identity()
     session.save_path = None
     session.dirty = False
     return ok(
@@ -1255,29 +1459,86 @@ def blockbench_health() -> dict[str, Any]:
 
 @mcp.tool(
     description=(
-        "请求 Blockbench 对当前视口截图（双通道：文件 + 图片），用于真实材质/光照验收。"
-        "path 不传时写 session 保存目录。要求 Blockbench 已打开且已加载插件桥；"
-        "若目标 .bbmodel 由 MCP 保存后未在 Blockbench 打开，先 blockbench_command(open, {path}) 刷新。"
+        "确保 Blockbench 插件桥可用：先探 /health，通了直接返回；不通则拉起 Blockbench"
+        "（默认 D:\\Blockbench\\Blockbench.exe，可用 exe 参数或环境变量 BLOCKBENCH_EXE 指定），"
+        "启动时清掉 ELECTRON_RUN_AS_NODE（否则 Electron 会把 Blockbench 当 node 跑、界面不出现），"
+        "然后轮询 /health 直到就绪。用来避免'截图/打开前还得手动先开 Blockbench'。"
+        "注意：首次仍需在 Blockbench 里手动加载一次插件桥；wait_seconds 控制等待上限。"
     )
 )
-def blockbench_screenshot(path: str | None = None) -> Any:
+def blockbench_ensure_running(
+    exe: str | None = None,
+    wait_seconds: float = 30.0,
+) -> dict[str, Any]:
+    try:
+        payload = ensure_blockbench_running(exe, wait_seconds=max(1.0, float(wait_seconds)))
+    except BBError as exc:
+        raise _err(exc) from exc
+    return ok("blockbench_ensure_running", payload)
+
+
+@mcp.tool(
+    description=(
+        "请求 Blockbench 对当前视口截图（双通道：文件 + 图片），用于真实材质/光照验收。"
+        "path 不传时写 session 保存目录。返回值里的 viewport 带上视口当前项目的 "
+        "save_path / elements（立方体数）/ blockbench_version —— 用来证明这张图到底是哪一版模型。"
+        "expect_path / expect_elements 可选：与视口实际状态不符时直接报错，"
+        "避免把旧模型的截图当成验收依据。"
+        "要求 Blockbench 已打开且已加载插件桥；若目标 .bbmodel 由 MCP 保存后未在 Blockbench 打开，"
+        "先 blockbench_command(open, {path}) 刷新；Blockbench 没开就先 blockbench_ensure_running。"
+    )
+)
+def blockbench_screenshot(
+    path: str | None = None,
+    expect_path: str | None = None,
+    expect_elements: int | None = None,
+    expect_revision: int | None = None,
+) -> Any:
     project = _project()
     if not path:
         folder = os.path.dirname(session.save_path) if session.save_path else os.getcwd()
         path = os.path.join(folder, f"{project.name}_blockbench.png")
+    driver = RemoteDriver()
     try:
-        written = RemoteDriver().screenshot(path)
+        # Capture provenance and pixels in the same native operation.
+        params = {"expect_path": expect_path, "expect_elements": expect_elements}
+        params = {key: value for key, value in params.items() if value is not None}
+        if expect_revision is not None:
+            params.update(expect_revision=expect_revision, expect_project_id=session.project_id)
+            if session.source_token:
+                params["expect_source_token"] = session.source_token
+        viewport = driver.capture(path, params)
+        written = path
         with open(written, "rb") as fh:
             png = fh.read()
     except BBError as exc:
         raise _err(exc) from exc
     except OSError as exc:
         raise ToolError(f"无法读写截图 {path}：{exc}") from exc
+
+    viewport.setdefault("project", viewport.get("name"))
+    mismatch: list[str] = []
+    if expect_path and not same_path(viewport["save_path"], expect_path):
+        mismatch.append(f"期望 save_path={expect_path}，视口实际 {viewport['save_path'] or '(空)'}")
+    if expect_elements is not None and viewport["elements"] != expect_elements:
+        mismatch.append(f"期望 elements={expect_elements}，视口实际 {viewport['elements']}")
+    if expect_revision is not None and (viewport.get("revision") != expect_revision or viewport.get("project_id") != session.project_id):
+        mismatch.append("视口工程版本与当前 MCP 会话不匹配")
+    if mismatch:
+        raise _tool_error(
+            "截图与期望不符，视口里很可能还是旧模型："
+            + "；".join(mismatch)
+            + f"（图已写到 {written}，可直接查看实际内容）",
+            "同一个 save_path 的 .bbmodel 在 Blockbench 里已经打开时不会自动重读磁盘；"
+            "先 project_sync 同步当前工程，再截图",
+        )
+
     data = ok(
         "blockbench_screenshot",
         {
             "image_path": written,
             "bytes": len(png),
+            "viewport": viewport,
             "hint": "查看真实渲染；不满意就在 Blockbench 调视角/贴图后重截，或回到 MCP 工具修改几何",
         },
     )
@@ -1286,22 +1547,90 @@ def blockbench_screenshot(path: str | None = None) -> Any:
 
 @mcp.tool(
     description=(
-        "向 Blockbench 插件桥发送命令。method 支持：open(path=...) 打开/重载 .bbmodel、"
-        "eval(code=...) 执行 Blockbench 脚本（仅插件侧白名单开启后可用）、undo()。"
+        "向 Blockbench 插件桥发送命令。method 支持："
+        "probe() 只读体检（报告真实可用的打开/截图/撤销 API，真机排障首选）；"
+        "open(path=...) 打开/重载 .bbmodel（Blockbench.read -> 官方 project codec）。"
+        "open 先验证文件，新工程/纹理就绪后才异步关闭同路径旧工程；默认保护未保存修改。"
+        "replace_unsaved=true 才允许替换旧工程的未保存修改；"
+        "若自证不通过会返回 ok=false + stale=true（否则会静默地让你对着旧模型继续验收）；"
+        "force_close=false 可禁止它关掉旧项目（此时遇到同路径项目会直接报 stale）；"
+        "reload() 同 open；reload_self() 让插件从磁盘热重载；"
+        "undo() 撤销活动项目最近一步；capture() 原子截图；eval(code=...) 执行 Blockbench 脚本（需插件侧白名单开启）。"
         "open 用于把 MCP 刚保存的 .bbmodel 同步进 Blockbench 视口，再截图验收。"
     )
 )
 def blockbench_command(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-    if method not in ("open", "reload", "eval", "undo"):
-        raise ToolError(
+    if method not in ("probe", "open", "reload", "reload_self", "eval", "undo", "capture", "animation_sample"):
+        raise _tool_error(
             f"未知命令 {method!r}",
-            "可用：open / reload / eval / undo",
+            "可用：probe / open / reload / reload_self / eval / undo / capture / animation_sample",
         )
     try:
         payload = RemoteDriver().command(method, params or {})
     except BBError as exc:
         raise _err(exc) from exc
+    # 插件如实报错时不要包成 ok=true ——那正是「open 报成功但视口是旧模型」的老问题
+    if payload.get("ok") is False:
+        raise _tool_error(
+            f"Blockbench 命令 {method} 未成功：{payload.get('error') or payload.get('result') or payload}",
+            payload.get("hint")
+            or "open 报 stale 说明视口里仍是旧模型：确认 path 正确，"
+            "必要时先关掉 Blockbench 里同路径的项目再重试",
+        )
     return ok("blockbench_command", {"method": method, **payload})
+
+
+@mcp.tool(description="原生 Blockbench 动画采样（需 project_sync 和桥接 0.6.0）。返回真实 Cuboid 动态包围盒、地面穿透与骨骼变换；不修改工程或播放状态。一次最多 128 个 {animation,time} 姿态。")
+def animation_sample(samples: list[dict[str, Any]], include_bones: bool = True,
+                     include_elements: bool = False, floor: float = 0, floor_tolerance: float = .05,
+                     contact_exclude_prefixes: list[str] | None = None) -> dict[str, Any]:
+    try:
+        return ok("animation_sample", animation_analysis.sample_native(samples, include_bones=include_bones,
+                  include_elements=include_elements, floor=floor, floor_tolerance=floor_tolerance,
+                  contact_exclude_prefixes=contact_exclude_prefixes))
+    except BBError as exc:
+        raise _err(exc) from exc
+
+
+@mcp.tool(description="动态动画验收（原生采样，不改模型）：检查 loop 首尾、指定 from/to 衔接、地面穿透，并计算可用于导出的动态 visible_bounds。animations 默认全部；sample_rate 0.1..60，最多 5000 姿态。报告速度差而不做审美评分。")
+def animation_review(animations: list[str] | None = None, transitions: list[dict[str, str]] | None = None,
+                     sample_rate: float = 12, bounds_margin: float = 16,
+                     floor: float = 0, floor_tolerance: float = .05,
+                     contact_exclude_prefixes: list[str] | None = None) -> dict[str, Any]:
+    try:
+        return ok("animation_review", animation_analysis.review_native(_project(), animations, transitions,
+                  sample_rate, bounds_margin, floor, floor_tolerance, contact_exclude_prefixes))
+    except BBError as exc:
+        raise _err(exc) from exc
+
+
+@mcp.tool(description="按指定动画/时间截取原生 PNG，并用 hero/front/rear/side/top 相机预设自动取景。采样、取景、版本凭证和截图在同一桥接操作内完成，随后恢复原视角/姿态。先 project_sync；可传 review 的 bounds 固定多帧构图。")
+def animation_preview(animation: str, path: str, time: float = 0,
+                      camera: str = "hero", fit_bounds: dict[str, list[float]] | None = None) -> Any:
+    try:
+        params = animation_analysis.native_proof()
+        params.update(animation=animation, time=finite_number(time, "time", minimum=0), camera=camera)
+        if fit_bounds is not None:
+            params["fit_bounds"] = fit_bounds
+        viewport = RemoteDriver(timeout=30).capture(path, params)
+        with open(path, "rb") as fh:
+            png = fh.read()
+        return [ok("animation_preview", {"image_path": path, "bytes": len(png), "viewport": viewport}), Image(data=png, format="png")]
+    except BBError as exc:
+        raise _err(exc) from exc
+    except OSError as exc:
+        raise ToolError(f"动画预览写入失败：{exc}") from exc
+
+
+@mcp.tool(description="原生动画 GIF 预览：传入动画名称序列（可以重复，如 takeoff/fly/fly/landing），固定相机与动态构图范围，保持实际时长并恢复每帧前的状态。需 project_sync；fps 1..20、size 64..768，最多 180 帧。文件完整生成后才替换输出。")
+def animation_render(animations: list[str], path: str, fps: int = 6, size: int = 512,
+                     camera: str = "hero", loop: bool = False) -> dict[str, Any]:
+    try:
+        return ok("animation_render", animation_analysis.render_native(_project(), animations, path, fps, size, camera, loop))
+    except BBError as exc:
+        raise _err(exc) from exc
+    except OSError as exc:
+        raise ToolError(f"动画 GIF 写入失败：{exc}") from exc
 
 
 def get_server() -> FastMCP:

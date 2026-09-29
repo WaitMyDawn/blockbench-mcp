@@ -6,4 +6,15 @@ __pycache__/
 .mcp.json
 dist/
 build/
+outputs/
+scripts/*
+!scripts/build_exe.ps1
+!scripts/smoke_stdio.py
+!scripts/verify_bridge_e2e.py
+!scripts/sync_bridge_plugin.py
+!scripts/probe_bridge_api.py
+!scripts/verify_reliability_e2e.py
+!scripts/verify_animation_e2e.py
 
+MCP-QA.md
+codex-ab.patch

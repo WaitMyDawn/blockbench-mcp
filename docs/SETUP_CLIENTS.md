@@ -1,13 +1,13 @@
 # 把 Blockbench MCP 接入你的客户端
 
-服务端已经具备：stdio 入口（`main.py`）、虚拟环境（`.venv`）、23+ 个工具。
+服务端已经具备：stdio 入口（`main.py`）、虚拟环境（`.venv`）与动态注册的 MCP 工具。
 接入 = 告诉你的客户端“用哪个命令启动它”。下面是各客户端的具体做法。
 
 ## 0. 前置检查（只做一次）
 
 ```powershell
 cd d:\VScode\python\blockbench-mcp
-.\.venv\Scripts\python.exe -m pytest -q          # 35 passed
+.\.venv\Scripts\python.exe -m pytest -q          # Python 与可选 Node 桥接回归
 .\.venv\Scripts\python.exe scripts\smoke_stdio.py # 打印工具数量即握手成功
 ```
 
