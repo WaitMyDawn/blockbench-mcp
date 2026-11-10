@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 import uuid as uuid_lib
 from dataclasses import dataclass, field
@@ -143,6 +144,25 @@ class Texture:
     pbr_channel: str = "color"
 
 
+def _keyframe_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Retain native editor metadata while validating geometric Bezier handles."""
+    if not isinstance(metadata, dict):
+        raise ValidationError("extra_fields 必须是对象")
+    reserved = {"uuid", "channel", "time", "data_points", "interpolation"}
+    if reserved.intersection(metadata):
+        raise ValidationError("extra_fields 不能覆盖关键帧的身份、时间或通道字段")
+    result = copy.deepcopy(metadata)
+    for name in ("bezier_left_time", "bezier_right_time", "bezier_left_value", "bezier_right_value"):
+        if name in result:
+            result[name] = _as_vec3(result[name], name)
+    for name, direction in (("bezier_left_time", -1), ("bezier_right_time", 1)):
+        if name in result and any(value * direction < 0 for value in result[name]):
+            raise ValidationError(f"{name} 必须指向相邻关键帧")
+    if "bezier_linked" in result and not isinstance(result["bezier_linked"], bool):
+        raise ValidationError("bezier_linked 必须是布尔值")
+    return result
+
+
 @dataclass
 class Keyframe:
     uuid: str
@@ -150,6 +170,10 @@ class Keyframe:
     time: float
     values: Vec3
     interpolation: str = "linear"  # linear / step / bezier / catmullrom
+    extra_fields: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.extra_fields = _keyframe_metadata(self.extra_fields)
 
 
 @dataclass
@@ -257,9 +281,14 @@ def parse_faces_spec(
 
 
 def _find_first(items: Iterable[Any], uuid_or_name: str, kind: str) -> Any:
+    named = None
     for item in items:
-        if item.uuid == uuid_or_name or item.name == uuid_or_name:
+        if item.uuid == uuid_or_name:
             return item
+        if named is None and item.name == uuid_or_name:
+            named = item
+    if named is not None:
+        return named
     raise NotFoundError(
         f"找不到 {kind}：{uuid_or_name!r}",
         f"先调用 project_status 查看现有 {kind} 的 uuid/name 再重试",
@@ -637,6 +666,7 @@ class BlockbenchProject:
         values: Vec3,
         *,
         interpolation: str = "linear",
+        extra_fields: dict[str, Any] | None = None,
     ) -> Keyframe:
         anim = self.animation(animation_uuid_or_name)
         group = self.group(bone_uuid_or_name)
@@ -649,6 +679,11 @@ class BlockbenchProject:
             )
         vals = _as_vec3(values, "values")
         t = finite_number(time, "time", minimum=0)
+        previous_animator = anim.animators.get(group.uuid)
+        previous = next((key for key in previous_animator.keyframes
+                         if key.channel == channel and abs(key.time - t) < 1e-4), None) if previous_animator else None
+        metadata = _keyframe_metadata(extra_fields if extra_fields is not None
+                                      else previous.extra_fields if previous else {})
         animator = anim.animators.setdefault(
             group.uuid,
             Animator(bone_uuid=group.uuid, bone_name=group.name),
@@ -659,7 +694,7 @@ class BlockbenchProject:
             k for k in animator.keyframes
             if not (k.channel == channel and abs(k.time - t) < 1e-4)
         ]
-        kf = Keyframe(uuid=new_uuid(), channel=channel, time=t, values=vals, interpolation=interpolation)
+        kf = Keyframe(uuid=new_uuid(), channel=channel, time=t, values=vals, interpolation=interpolation, extra_fields=metadata)
         animator.keyframes.append(kf)
         anim.length = max(anim.length, t)
         return kf

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import os
 import struct
 import zlib
@@ -29,6 +30,8 @@ from . import paint as paint_lib
 from . import preview as preview_renderer
 from . import quality as quality_checker
 from . import animation_analysis
+from .edit_scope import EditScope
+from .face_scope import FaceScope, face_refs
 from .result import ok
 from .session import session
 from . import undo as undo_lib
@@ -43,6 +46,8 @@ mcp = FastMCP(
         "export_model 落盘；Blockbench 可直接打开保存的 .bbmodel。"
         "参数化建模（几十上百个方块）优先用 cubes_create_bulk，一次调用建一批，"
         "比逐个 cube_create 少上千次往返。"
+        "用户指定 Blockbench 修改范围时，先调用 scope_status，再用 scope_preview 生成局部草稿，"
+        "选面重绘使用 scope_repaint。展示前后差异，经用户验收后用 scope_commit 提交。"
     ),
 )
 
@@ -65,10 +70,26 @@ def _project() -> BlockbenchProject:
     return session.require_project()
 
 
+def _require_no_scope() -> None:
+    # The desktop can confirm a scope before the first scoped MCP call.
+    if session.scope_id is None and session.scope_bridge and not session.dirty and session.synced_revision == session.revision:
+        try:
+            proof = _scope_proof()
+            payload = RemoteDriver(timeout=0.5).command("scope_get", {**proof, "detect_only": True})
+        except BBError:
+            payload = {}
+        scope = payload.get("scope")
+        if payload.get("ok") and isinstance(scope, dict) and isinstance(scope.get("id"), str):
+            session.scope_id = scope["id"]
+    if session.scope_id is not None:
+        raise _tool_error("当前处于局部编辑模式", "使用 scope_preview 或 scope_repaint 预览，再提交或取消范围")
+
+
 def _edit(fn):
     """Register edits as atomic, undoable document transactions."""
     @wraps(fn)
     def wrapped(*args, **kwargs):
+        _require_no_scope()
         project = _project()
         dirty = session.dirty
         try:
@@ -195,6 +216,7 @@ def project_create(
     box_uv: bool = False,
     model_identifier: str = "",
 ) -> dict[str, Any]:
+    _require_no_scope()
     project = BlockbenchProject(
         name=name,
         format_id=format,
@@ -213,6 +235,7 @@ def project_create(
 
 @mcp.tool(description="打开 .bbmodel 文件到当前会话（覆盖未保存的内存项目）。返回项目摘要。")
 def project_open(path: str) -> dict[str, Any]:
+    _require_no_scope()
     try:
         project = bbmodel_codec.read(path)
     except BBError as exc:
@@ -231,6 +254,7 @@ def project_open(path: str) -> dict[str, Any]:
 
 @mcp.tool(description="把当前项目保存为 .bbmodel。path 缺省时写回打开时的路径。")
 def project_save(path: str | None = None) -> dict[str, Any]:
+    _require_no_scope()
     project = _project()
     target = path or session.save_path
     if not target:
@@ -248,6 +272,7 @@ def project_save(path: str | None = None) -> dict[str, Any]:
 @mcp.tool(description="保存内存工程并可靠同步到 Blockbench，等待工程/纹理/视口就绪，返回实际加载的 project_id/revision/source_token。默认保护视口未保存修改；replace_unsaved=True 才允许替换。插件桥须已运行。")
 def project_sync(path: str | None = None, replace_unsaved: bool = False, wait_seconds: float = 10.0,
                  expected_revision: int | None = None) -> dict[str, Any]:
+    _require_no_scope()
     _project()
     target = path or session.save_path
     if not target:
@@ -277,6 +302,7 @@ def project_sync(path: str | None = None, replace_unsaved: bool = False, wait_se
             or payload.get("revision") != session.revision or payload.get("project_id") != session.project_id):
         raise _tool_error(f"工程同步未确认：{payload.get('error') or payload}")
     session.synced_revision = session.revision
+    session.scope_bridge = "scope_get" in health.get("methods", [])
     return ok("project_sync", {"path": target, "viewport": payload, "revision": session.revision})
 
 
@@ -301,6 +327,232 @@ def project_status() -> dict[str, Any]:
 def project_outline() -> dict[str, Any]:
     project = _project()
     return ok("project_outline", {"outline": project.outline_tree()})
+
+
+def _scope_proof() -> dict[str, Any]:
+    if session.dirty or session.synced_revision != session.revision or not session.source_token:
+        raise _tool_error("局部编辑需要先同步当前工程", "调用 project_sync 后，在 Blockbench 中确认范围")
+    proof = {
+        "expect_project_id": session.project_id,
+        "expect_revision": session.revision,
+        "expect_source_token": session.source_token,
+    }
+    if session.save_path:
+        proof["expect_path"] = session.save_path
+    return proof
+
+
+def _scope_command(method: str, params: dict[str, Any]) -> dict[str, Any]:
+    try:
+        payload = RemoteDriver().command(method, params)
+    except BBError as exc:
+        raise _err(exc) from exc
+    if not payload.get("ok"):
+        raise _tool_error(str(payload.get("error", "局部编辑桥接请求失败")), "检查当前工程、选区和插件桥版本")
+    return payload
+
+
+def _valid_scope(payload: Any) -> bool:
+    return isinstance(payload, dict) and isinstance(payload.get("id"), str) and bool(payload["id"])
+
+
+def _import_manual_face_scope() -> dict[str, Any] | None:
+    if session.dirty:
+        raise _tool_error("MCP 当前工程有未保存的修改", "先保存当前工程，或用新的 MCP 会话读取 Blockbench")
+    result = _scope_command("scope_import", {})
+    payload = result.get("scope")
+    if payload is None:
+        return None
+    stamp, model = result.get("stamp"), result.get("model")
+    if (
+        not _valid_scope(payload) or payload.get("confirmed") is not True or "faces" not in payload
+        or not isinstance(stamp, dict) or not isinstance(model, dict)
+        or not isinstance(stamp.get("project_id"), str) or not stamp["project_id"]
+        or not isinstance(stamp.get("source_token"), str) or not stamp["source_token"]
+        or type(stamp.get("revision")) is not int or stamp["revision"] < 0
+    ):
+        raise _tool_error("插件返回了不完整的选面工程快照")
+    elements = model.get("elements")
+    if not isinstance(elements, list) or any(
+        not isinstance(element, dict) or element.get("type", "cube") != "cube" for element in elements
+    ):
+        raise _tool_error("自动读取选面范围目前支持立方体工程")
+    try:
+        project = bbmodel_codec.project_from_dict(model)
+        FaceScope.read(project, payload)
+    except BBError as exc:
+        raise _err(exc) from exc
+    except (TypeError, ValueError, KeyError) as exc:
+        raise _tool_error("Blockbench 工程快照格式不完整") from exc
+    session.new_identity()
+    session.project = project
+    # The open native tab is an input snapshot, not an implicit disk overwrite target.
+    session.save_path = None
+    session.project_id = stamp["project_id"]
+    session.revision = session.synced_revision = stamp["revision"]
+    session.source_token = stamp["source_token"]
+    session.scope_bridge = True
+    undo_lib.manager.reset_if_project_changed(project)
+    return payload
+
+
+def _read_scope(*, allow_import: bool = True) -> dict[str, Any]:
+    payload = None
+    sync_error = None
+    try:
+        payload = _scope_command("scope_get", _scope_proof()).get("scope")
+    except ToolError as exc:
+        sync_error = exc
+    if payload is None and session.scope_id is None and allow_import:
+        try:
+            payload = _import_manual_face_scope()
+        except ToolError as exc:
+            if "unknown command" not in str(exc):
+                raise
+            if sync_error is not None:
+                raise sync_error from exc
+    elif payload is None and sync_error is not None:
+        raise sync_error
+    if not _valid_scope(payload):
+        raise _tool_error("当前工程没有局部编辑范围", "在 Blockbench 使用「设为 MCP 修改范围」或「设为 MCP 重绘面」")
+    if session.scope_id != payload["id"]:
+        session.scope_id = payload["id"]
+        session.scope_draft = None
+    return payload
+
+
+def _scope_definition(payload: dict[str, Any]) -> EditScope | FaceScope:
+    try:
+        return (FaceScope if "faces" in payload else EditScope).read(_project(), payload)
+    except BBError as exc:
+        raise _err(exc) from exc
+
+
+def _confirmed_scope() -> EditScope | FaceScope:
+    payload = _read_scope()
+    if payload.get("confirmed") is not True:
+        raise _tool_error("局部编辑范围待确认", "在 Blockbench 检查高亮后使用「确认 MCP 提议范围」")
+    return _scope_definition(payload)
+
+
+@mcp.tool(description="读取 Blockbench 中固定的局部编辑范围并进入局部编辑模式。手动确认的重绘面可自动读取打开的原生工程，无需预先 project_sync。方块范围包含父骨骼和空间边界，面范围包含纹理 UV 和可编辑像素数量。")
+def scope_status() -> dict[str, Any]:
+    payload = _read_scope()
+    scope = _scope_definition(payload)
+    return ok("scope_status", {
+        **scope.summary(_project()), "confirmed": payload.get("confirmed") is True,
+        "kind": "faces" if isinstance(scope, FaceScope) else "geometry",
+        "draft_id": session.scope_draft.id if session.scope_draft else None,
+        "revision": session.revision,
+    })
+
+
+@mcp.tool(description="按方块 UUID 向 Blockbench 提议局部编辑范围。插件高亮待确认范围，需用户在 Blockbench 点「确认 MCP 提议范围」后才能预览修改。")
+def scope_propose(uuids: list[str]) -> dict[str, Any]:
+    _require_no_scope()
+    project = _project()
+    if not uuids or len(set(uuids)) != len(uuids) or any(project.find_element_by_uuid(uid) is None for uid in uuids):
+        raise _tool_error("提议范围必须包含当前工程中不重复的方块 UUID")
+    scope_id = _submit_scope_proposal({"uuids": uuids})
+    return ok("scope_propose", {"scope_id": scope_id, "confirmed": False, "uuids": uuids})
+
+
+def _submit_scope_proposal(selection: dict[str, Any]) -> str:
+    payload = _scope_command("scope_propose", {**_scope_proof(), **selection}).get("scope")
+    if not isinstance(payload, dict) or not isinstance(payload.get("id"), str):
+        raise _tool_error("插件未返回有效的提议范围")
+    session.scope_id = payload["id"]
+    return session.scope_id
+
+
+@mcp.tool(description="提议一组待重绘的方块面，允许不同方块和不相连 UV。每项为 {uuid, face}，需用户在 Blockbench 中确认高亮范围。")
+def scope_propose_faces(faces: list[dict[str, str]]) -> dict[str, Any]:
+    _require_no_scope()
+    try:
+        refs = face_refs(_project(), faces)
+    except BBError as exc:
+        raise _err(exc) from exc
+    selection = [{"uuid": uid, "face": face} for uid, face in refs]
+    scope_id = _submit_scope_proposal({"faces": selection})
+    return ok("scope_propose_faces", {"scope_id": scope_id, "confirmed": False, "faces": selection})
+
+
+@mcp.tool(description=(
+    "在已确认范围内预览整批方块操作。每次调用从当前版本重建草稿，返回增删改明细、同视角前后对比图和 draft_id。"
+    "每项 op 为 add（name、from_、to、parent），update（uuid 和需修改字段）或 delete（uuid）。"
+    "几何字段为 name/from_/to/origin/rotation；新增 parent 使用 scope_status 中的 UUID 或已允许的 null。"
+    "修改包围盒需同时提供 from_ 和 to。提交时使用预览返回的 draft_id。"
+))
+def scope_preview(operations: list[dict[str, Any]], yaw: float = 45.0, pitch: float = 28.0) -> Any:
+    project = _project()
+    scope = _confirmed_scope()
+    if not isinstance(scope, EditScope):
+        raise _tool_error("当前范围用于选面重绘", "使用 scope_repaint")
+    try:
+        draft = scope.stage(project, operations)
+        png = draft.preview(project, finite_number(yaw, "yaw"), finite_number(pitch, "pitch"))
+    except BBError as exc:
+        raise _err(exc) from exc
+    session.scope_draft = draft
+    return [ok("scope_preview", {"draft_id": draft.id, "scope_id": scope.id, **draft.diff}), Image(data=png, format="png")]
+
+
+@mcp.tool(description=(
+    "预览已确认的选面重绘，返回前后贴图和 draft_id。支持不相连的面和多纹理。"
+    "操作 paint 接受 uuid、face、ops（同 texture_paint_face，无 region）；"
+    "replace_png 接受纹理 UUID 和 source_path，载入同尺寸候选 PNG。"
+    "会拒绝任何选区外或与未选面共享的像素变化，含透明度。验收后调用 scope_commit。"
+))
+def scope_repaint(operations: list[dict[str, Any]]) -> Any:
+    scope = _confirmed_scope()
+    if not isinstance(scope, FaceScope):
+        raise _tool_error("当前范围用于几何重建", "在 Blockbench 设置选面范围，或使用 scope_propose_faces")
+    try:
+        draft, png = scope.stage(_project(), operations)
+    except BBError as exc:
+        raise _err(exc) from exc
+    session.scope_draft = draft
+    return [ok("scope_repaint", {"draft_id": draft.id, "scope_id": scope.id, **draft.diff}), Image(data=png, format="png")]
+
+
+@mcp.tool(description="用户验收后提交指定 draft_id 的局部编辑草稿，一次提交对应一次 project_undo。提交后可 project_sync 更新桌面视口。")
+def scope_commit(draft_id: str) -> dict[str, Any]:
+    project = _project()
+    draft = session.scope_draft
+    if draft is None or draft.id != draft_id:
+        raise _tool_error("找不到指定草稿", "先调用 scope_preview 生成并检查差异")
+    scope = _confirmed_scope()
+    if session.scope_draft is not draft:
+        raise _tool_error("编辑范围已变更", "重新调用 scope_preview")
+    with undo_lib.manager.transaction(project, "scope_commit"):
+        if isinstance(scope, FaceScope):
+            project.textures = draft.project.textures
+        else:
+            project.elements = draft.project.elements
+            project.groups = draft.project.groups
+            project.root_children = draft.project.root_children
+    session.edited()
+    warnings = _clear_scope(scope.id)
+    return ok("scope_commit", {"revision": session.revision, "scope_id": scope.id, **draft.diff}, warnings)
+
+
+def _clear_scope(scope_id: str | None) -> list[str]:
+    session.scope_id = None
+    session.scope_draft = None
+    if scope_id is not None:
+        try:
+            _scope_command("scope_clear", {"scope_id": scope_id})
+        except ToolError:
+            return ["插件视口标记未能清除，可在 Blockbench 中使用「清除 MCP 修改范围」"]
+    return []
+
+
+@mcp.tool(description="放弃局部草稿、退出局部编辑模式，并清除对应的 Blockbench 范围标记。")
+def scope_cancel() -> dict[str, Any]:
+    scope_id = session.scope_id
+    if scope_id is None:
+        scope_id = _read_scope(allow_import=False)["id"]
+    return ok("scope_cancel", {"scope_id": scope_id}, _clear_scope(scope_id))
 
 
 # ---------------------------------------------------------------------------
@@ -751,7 +1003,8 @@ def animation_create(
 @mcp.tool(
     description=(
         "为某骨骼在指定动画中添加关键帧。channel: rotation/position/scale；values 为 [x,y,z]；"
-        "interpolation: linear/step/bezier/catmullrom。同一骨骼同一通道同一时间会覆盖旧帧。"
+        "interpolation: linear/step/bezier/catmullrom。extra_fields 可设置原生 bezier_left/right_time/value 与 bezier_linked；"
+        "同一骨骼同一通道同一时间覆盖旧帧，未传 extra_fields 时保留原有曲线手柄。"
     )
 )
 @_edit
@@ -762,6 +1015,7 @@ def keyframe_add(
     time: float,
     values: list[float],
     interpolation: str = "linear",
+    extra_fields: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     project = _project()
     try:
@@ -772,6 +1026,7 @@ def keyframe_add(
             time,
             values,
             interpolation=interpolation,
+            extra_fields=extra_fields,
         )
     except BBError as exc:
         raise _err(exc) from exc
@@ -787,6 +1042,7 @@ def keyframe_add(
                 "time": kf.time,
                 "values": kf.values,
                 "interpolation": kf.interpolation,
+                "extra_fields": copy.deepcopy(kf.extra_fields),
             }
         },
     )
@@ -809,6 +1065,7 @@ def keyframe_list(animation: str | None = None) -> dict[str, Any]:
                         "time": kf.time,
                         "values": kf.values,
                         "interpolation": kf.interpolation,
+                        "extra_fields": copy.deepcopy(kf.extra_fields),
                     }
                 )
             entry["bones"][group.name if group else ator.bone_name] = kfs
@@ -828,6 +1085,7 @@ def keyframes_add_bulk(keyframes: list[dict[str, Any]], include_ids: bool = Fals
             kf = project.add_keyframe(
                 spec["animation"], spec["bone"], spec["channel"], spec["time"], spec["values"],
                 interpolation=spec.get("interpolation", "linear"),
+                extra_fields=spec.get("extra_fields"),
             )
         except (BBError, KeyError, TypeError, ValueError) as exc:
             raise _tool_error(f"关键帧批量编辑已回滚：index={index}，{exc}") from exc
@@ -1178,6 +1436,7 @@ def texture_redo() -> dict[str, Any]:
     )
 )
 def project_undo() -> dict[str, Any]:
+    _require_no_scope()
     project = _project()
     try:
         result = undo_lib.manager.doc_undo_once(project)
@@ -1189,6 +1448,7 @@ def project_undo() -> dict[str, Any]:
 
 @mcp.tool(description="重做一次被 project_undo 撤销的文档级操作。")
 def project_redo() -> dict[str, Any]:
+    _require_no_scope()
     project = _project()
     try:
         result = undo_lib.manager.doc_redo_once(project)
@@ -1206,6 +1466,7 @@ def undo_status() -> dict[str, Any]:
 
 @mcp.tool(description="清空全部 undo/redo 历史（像素级与文档级）。")
 def undo_clear() -> dict[str, Any]:
+    _require_no_scope()
     project = _project()
     undo_lib.manager.clear_all()
     undo_lib.manager.reset_if_project_changed(project)
@@ -1236,6 +1497,7 @@ def export_model(
     sample_rate: float = 12,
     bounds_margin: float = 16,
 ) -> dict[str, Any]:
+    _require_no_scope()
     project = _project()
     target = target.lower()
     try:
@@ -1300,6 +1562,7 @@ def project_load_example(
     template: str = "sword_geckolib",
     name: str | None = None,
 ) -> dict[str, Any]:
+    _require_no_scope()
     try:
         project = examples_lib.load(template, name=name)
         entry = examples_lib.sample_info(template)
@@ -1560,6 +1823,8 @@ def blockbench_screenshot(
     )
 )
 def blockbench_command(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    if method in ("open", "reload", "reload_self", "eval", "undo"):
+        _require_no_scope()
     if method not in ("probe", "open", "reload", "reload_self", "eval", "undo", "capture", "animation_sample"):
         raise _tool_error(
             f"未知命令 {method!r}",

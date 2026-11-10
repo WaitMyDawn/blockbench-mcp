@@ -16,8 +16,8 @@ def rotate_point(origin: list[float], rotation: list[float], point: list[float])
     return [x + origin[0], y + origin[1], z + origin[2]]
 
 
-def world_cubes(project: BlockbenchProject) -> list[tuple[Element, list[list[float]]]]:
-    """Transform each exported cube's eight corners, child first then ancestors."""
+def world_cubes(project: BlockbenchProject, *, include_non_exported: bool = False) -> list[tuple[Element, list[list[float]]]]:
+    """Transform cube corners in modeling pose, child first then ancestors."""
     groups = {g.uuid: g for g in project.groups}
     elements = {e.uuid: e for e in project.elements}
     results = []
@@ -28,11 +28,11 @@ def world_cubes(project: BlockbenchProject) -> list[tuple[Element, list[list[flo
                 g = groups[uid]
                 if uid in active:
                     raise ValidationError(f"骨骼层级存在环：{g.name}")
-                if g.export:
+                if g.export or include_non_exported:
                     walk(g.children, ancestors + [g], active | {uid})
                 continue
             cube = elements.get(uid)
-            if cube is None or not cube.export:
+            if cube is None or (not cube.export and not include_non_exported):
                 continue
             corners = []
             for x in (cube.from_[0], cube.to[0]):

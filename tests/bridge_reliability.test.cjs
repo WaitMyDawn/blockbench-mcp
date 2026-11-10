@@ -222,3 +222,225 @@ test('fresh format-plugin dirty flag is accepted only while full serialized cont
     assert.equal(b.c.captureCommand(params).ok,false);
     assert.equal(p.saved,false);
 });
+
+async function scopeBridge() {
+    const {c, old} = bridge();
+    const actions = {}, listeners = {};
+    let seq = 0;
+    class Vector {
+        constructor(x = 0, y = 0, z = 0) { this.values = [x, y, z]; }
+        fromArray(values) { this.values = Array.from(values); return this; }
+        toArray() { return this.values.slice(); }
+        copy(vector) { return this.fromArray(vector.values); }
+    }
+    class Box {
+        constructor(min = new Vector(Infinity, Infinity, Infinity), max = new Vector(-Infinity, -Infinity, -Infinity)) {
+            Object.assign(this, {min, max});
+        }
+        setFromPoints(points) {
+            return points.reduce((box, point) => box.union(new Box(point, point)), this);
+        }
+        union(other) {
+            this.min = new Vector(...this.min.values.map((lo, i) => Math.min(lo, other.min.values[i])));
+            this.max = new Vector(...this.max.values.map((hi, i) => Math.max(hi, other.max.values[i])));
+            return this;
+        }
+        containsBox(other) {
+            return this.min.values.every((lo, i) => lo <= other.min.values[i] && other.max.values[i] <= this.max.values[i]);
+        }
+        intersectsBox(other) {
+            return this.min.values.every((lo, i) => lo <= other.max.values[i] && other.min.values[i] <= this.max.values[i]);
+        }
+        getCenter(out) { return out.fromArray(this.min.values.map((lo, i) => (lo + this.max.values[i]) / 2)); }
+        getSize(out) { return out.fromArray(this.min.values.map((lo, i) => this.max.values[i] - lo)); }
+    }
+    class Group {
+        constructor() { this.children = []; }
+        add(item) { this.children.push(item); item.parent = this; }
+        removeFromParent() { this.parent.children.splice(this.parent.children.indexOf(this), 1); }
+        traverse(callback) { callback(this); this.children.forEach(callback); }
+    }
+    class Resource {
+        setFromPoints(points) { this.points = points; return this; }
+        dispose() { this.disposed = true; }
+    }
+    class Mesh {
+        constructor(geometry, material) {
+            Object.assign(this, {geometry, material, position: new Vector()});
+        }
+    }
+    class Outline extends Mesh {
+        constructor() { super(new Resource(), new Resource()); }
+    }
+    Object.assign(c, {
+        guid: () => 'scope-' + (++seq),
+        THREE: {Vector3: Vector, Box3: Box, Group, Mesh, Box3Helper: Outline, BoxGeometry: Resource,
+            MeshBasicMaterial: Resource, LineLoop: Mesh, BufferGeometry: Resource, LineBasicMaterial: Resource},
+        Action: class { constructor(id, spec) { actions[id] = spec; } },
+        MenuBar: {menus: {tools: {addAction() {}}}},
+        Dialog: class { constructor(options) { this.options = options; } show() {} },
+    });
+    c.Canvas.gizmos = [];
+    c.Canvas.scene = new Group();
+    c.Blockbench.on = (name, callback) => { listeners[name] = callback; };
+    c.Codecs.project.compile = () => ({elements: c.Cube.all.map(cube => [cube.uuid, cube.value])});
+    await c.openProject(old.save_path, {});
+    const project = c.Blockbench.Project;
+    const inside = {uuid: 'foot', value: 1, mesh: {updateWorldMatrix() {}}, getGlobalVertexPositions: () => [[0, 0, 0], [2, 2, 2]]};
+    const crossing = {uuid: 'belt', value: 2, mesh: {updateWorldMatrix() {}}, getGlobalVertexPositions: () => [[0, 1, 0], [2, 4, 2]]};
+    const texture = {uuid: 'atlas'};
+    function face(uv) {
+        return {uv, getTexture: () => texture, getVertexIndices: () => [0, 1, 0, 1]};
+    }
+    inside.name = 'Foot';
+    crossing.name = 'Belt';
+    inside.faces = {north: face([0, 0, 2, 2]), west: face([2, 0, 4, 2])};
+    crossing.faces = {south: face([8, 8, 12, 12])};
+    project.getUVWidth = project.getUVHeight = () => 16;
+    c.Cube.all.splice(0, 1, inside, crossing);
+    project.mcp_bridge_load_baseline = c.nativeDocumentContent();
+    c.Cube.selected = [inside];
+    const plugin = {};
+    c.registerScopeActions(plugin);
+    return {c, project, inside, crossing, actions, listeners, plugin};
+}
+
+test('fixed manual scope is a disposable viewport gizmo, independent of native selection', async () => {
+    const {c, project, actions, listeners, plugin} = await scopeBridge();
+    const savedModel = c.nativeDocumentContent();
+    actions.mcp_scope_select.click();
+    const overlay = plugin.scopeOverlay;
+    assert.equal(overlay.no_export, true);
+    assert.deepEqual(c.Canvas.scene.children, [overlay]);
+    assert.deepEqual(c.Canvas.gizmos, [overlay]);
+    c.Cube.selected = [];
+    const selected = await c.runCommand(plugin, 'scope_get', {expect_project_id: 'document', expect_revision: 2});
+    assert.equal(selected.scope.confirmed, true);
+    assert.deepEqual(Array.from(selected.scope.uuids), ['foot']);
+    assert.equal(c.nativeDocumentContent(), savedModel);
+    assert.equal(project.saved, true);
+    listeners.unselect_project();
+    assert.deepEqual(c.Canvas.scene.children, []);
+    assert.deepEqual(c.Canvas.gizmos, []);
+    assert.equal(overlay.children[0].geometry.disposed, true);
+    listeners.select_project();
+    assert.equal(c.Canvas.scene.children.length, 1);
+    actions.mcp_scope_clear.click();
+    assert.deepEqual(c.Canvas.scene.children, []);
+    assert.equal(c.nativeDocumentContent(), savedModel);
+});
+
+test('proposal requires native confirmation and an unchanged model', async () => {
+    const {c, inside, actions, plugin} = await scopeBridge();
+    const params = {expect_project_id: 'document', expect_revision: 2, expect_source_token: 'fresh'};
+    const response = await c.runCommand(plugin, 'scope_propose', {...params, uuids: ['foot'], confirmed: true});
+    assert.equal(response.scope.confirmed, false);
+    actions.mcp_scope_confirm.click();
+    const confirmed = await c.runCommand(plugin, 'scope_get', params);
+    assert.equal(confirmed.scope.confirmed, true);
+    assert.equal(confirmed.scope.id, response.scope.id);
+    inside.value = 99;
+    assert.equal((await c.runCommand(plugin, 'scope_get', params)).ok, false);
+});
+
+test('transparent box includes only wholly enclosed cubes and stays out of the saved model', async () => {
+    const {c, actions, plugin} = await scopeBridge();
+    const savedModel = c.nativeDocumentContent();
+    actions.mcp_scope_region.click();
+    const {onFormChange, onConfirm} = plugin.scopeDialog.options;
+    const bounds = {min: [0, 0, 0], max: [2, 3, 2]};
+    onFormChange(bounds);
+    assert.equal(plugin.scopeOverlay.children.length, 4);
+    assert.equal(plugin.editScope, undefined);
+    onConfirm(bounds);
+    const result = await c.runCommand(plugin, 'scope_get', {});
+    assert.equal(result.scope.confirmed, true);
+    assert.deepEqual(Array.from(result.scope.uuids), ['foot']);
+    assert.equal(c.nativeDocumentContent(), savedModel);
+});
+
+test('manual face scope keeps explicit faces and includes unselected atlas footprints', async () => {
+    const {c, inside, crossing, actions, plugin} = await scopeBridge();
+    c.Cube.selected = [inside, crossing];
+    const native = c.nativeDocumentContent();
+    actions.mcp_scope_faces.click();
+    plugin.scopeDialog.options.onConfirm({face_0: true, face_2: true});
+    c.Cube.selected = [];
+    const result = await c.runCommand(plugin, 'scope_get', {});
+    assert.equal(result.scope.confirmed, true);
+    assert.deepEqual(Array.from(result.scope.faces, ref => ref.face), ['north', 'south']);
+    assert.equal(result.scope.footprints.length, 3);
+    assert.equal(plugin.scopeOverlay.children.length, 4);
+    assert.equal(c.nativeDocumentContent(), native);
+    const overlay = plugin.scopeOverlay;
+    actions.mcp_scope_clear.click();
+    assert.equal(c.Canvas.scene.children.length, 0);
+    assert.equal(overlay.children[0].geometry.disposed, true);
+});
+
+test('agent face proposal stays pending until the native confirmation action', async () => {
+    const {c, inside, actions, plugin} = await scopeBridge();
+    const proposal = await c.runCommand(plugin, 'scope_propose', {faces: [{uuid: inside.uuid, face: 'west'}]});
+    assert.equal(proposal.scope.confirmed, false);
+    actions.mcp_scope_confirm.click();
+    assert.equal((await c.runCommand(plugin, 'scope_get', {})).scope.confirmed, true);
+});
+
+test('manual faces attach to an open unsaved project without a preceding MCP sync', async () => {
+    const {c, project, inside, actions, plugin} = await scopeBridge();
+    project.saved = false;
+    delete project.mcp_bridge_sync;
+    delete project.mcp_bridge_load_baseline;
+    const content = c.nativeDocumentContent();
+    assert.equal((await c.runCommand(plugin, 'scope_import', {})).scope, null);
+    actions.mcp_scope_faces.click();
+    plugin.scopeDialog.options.onConfirm({face_0: true});
+    const result = await c.runCommand(plugin, 'scope_import', {});
+    assert.equal(result.scope.faces[0].uuid, inside.uuid);
+    assert.equal(result.stamp.revision, 0);
+    assert.equal(JSON.stringify(result.model), content);
+    assert.equal(project.saved, false);
+    assert.equal(c.Blockbench.Project, project);
+    const proof = Object.fromEntries(Object.entries(result.stamp).map(([key, value]) => ['expect_' + key, value]));
+    assert.equal((await c.runCommand(plugin, 'scope_get', proof)).ok, true);
+    inside.value++;
+    assert.equal((await c.runCommand(plugin, 'scope_import', {})).ok, false);
+});
+
+test('UV panel locks native selected faces and draws persistent marks only on their atlas', async () => {
+    const {c, inside, crossing, plugin} = await scopeBridge();
+    class Node {
+        constructor() { this.children = []; this.style = {}; this.classList = {toggle() {}}; this.events = {}; }
+        addEventListener(name, action) { this.events[name] = action; }
+        append(...nodes) { nodes.forEach(node => { this.children.push(node); node.parentNode = this; }); }
+        prepend(node) { this.children.unshift(node); node.parentNode = this; }
+        remove() { this.parentNode.children.splice(this.parentNode.children.indexOf(this), 1); }
+    }
+    const frame = new Node(), header = new Node();
+    c.document = {createElement: () => new Node(), getElementById: () => header};
+    c.Cube.selected = [inside, crossing];
+    c.UVEditor = {
+        getMappableElements: () => c.Cube.selected,
+        getSelectedFaces: cube => cube === inside ? ['west'] : ['south'],
+        texture: {uuid: 'atlas'},
+        vue: {$refs: {frame}, toPixels: value => (value * 10) + 'px'},
+    };
+    c.refreshScopeUV(plugin);
+    assert.equal(header.children[0].children[0].textContent, '锁定选面');
+    header.children[0].children[0].events.click({stopPropagation() {}});
+    const scope = (await c.runCommand(plugin, 'scope_get', {})).scope;
+    assert.deepEqual(Array.from(scope.faces, ref => ref.face), ['west', 'south']);
+    c.Cube.selected = [];
+    c.refreshScopeUV(plugin);
+    assert.equal(plugin.scopeUVBadge.textContent, '已锁定 2 面');
+    assert.equal(plugin.scopeUVBadge.hidden, false);
+    assert.equal(frame.children[0].children.length, 2);
+    assert.equal(frame.children[0].children[0].style.left, '20px');
+    assert.equal(frame.children[0].children[1].children[0].textContent, '南');
+    c.UVEditor.texture = {uuid: 'different'};
+    c.refreshScopeUV(plugin);
+    assert.equal(frame.children.length, 0);
+    assert.equal(plugin.scopeUVBadge.hidden, false);
+    c.unregisterScopeUV(plugin);
+    assert.equal(header.children.length, 0);
+});

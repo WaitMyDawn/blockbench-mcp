@@ -168,9 +168,11 @@ def render_png(
     yaw: float = 45.0,
     pitch: float = 28.0,
     supersample: int = 2,
+    frame_points: list[Vec] | None = None,
+    include_non_exported: bool = False,
 ) -> bytes:
     """渲染模型为 PNG（形状验收用途）。"""
-    cubes = _collect_cubes(project)
+    cubes = world_cubes(project, include_non_exported=include_non_exported)
     if not cubes:
         cubes = []
     pixels_cache = _load_texture_pixels(project)
@@ -201,7 +203,11 @@ def render_png(
     faces3d.sort(key=lambda f: f.depth, reverse=True)  # 远 → 近
 
     # ---- 缩放：根据所有顶点包围盒适配画布
-    all_pts = [view(c) for _, corners in cubes for c in corners]
+    all_pts = (
+        [view(point) for point in frame_points]
+        if frame_points is not None
+        else [view(c) for _, corners in cubes for c in corners]
+    )
     if all_pts:
         xs = [p[0] for p in all_pts]
         ys = [p[1] for p in all_pts]

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import json
 import os
 import tempfile
@@ -206,8 +207,9 @@ def project_to_dict(project: BlockbenchProject) -> dict[str, Any]:
                 for kf in ator.keyframes:
                     keyframes.append(
                         {
+                            **copy.deepcopy(kf.extra_fields),
                             "channel": kf.channel,
-                            "time": round(kf.time, 4),
+                            "time": kf.time,
                             "interpolation": kf.interpolation,
                             "uuid": kf.uuid,
                             "color": -1,
@@ -433,6 +435,8 @@ def project_from_dict(data: dict[str, Any], *, path: str | None = None) -> Block
                         time=finite_number(kf_raw.get("time") or 0.0, "time", minimum=0),
                         values=[num(dp.get("x")), num(dp.get("y")), num(dp.get("z"))],
                         interpolation=kf_raw.get("interpolation") or "linear",
+                        extra_fields={key: copy.deepcopy(value) for key, value in kf_raw.items()
+                                      if key not in {"uuid", "channel", "time", "data_points", "interpolation"}},
                     )
                 )
             if ator.keyframes:

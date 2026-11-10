@@ -23,7 +23,9 @@
  */
 
 var BRIDGE_PORT = 18765;
-var BRIDGE_VERSION = '0.6.0';
+var BRIDGE_VERSION = '0.10.0';
+var SCOPE_FACES = ['north', 'south', 'east', 'west', 'up', 'down'];
+var SCOPE_FACE_LABELS = {north: '北', south: '南', east: '东', west: '西', up: '顶', down: '底'};
 // Blockbench.read 在文件读不到时只会弹错误框、不回调，所以这里自我兜底一个超时。
 var READ_TIMEOUT_MS = 5000;
 
@@ -266,7 +268,8 @@ function healthPayload(plugin) {
 		source_token: summary.source_token,
 		phase: 'bridge-js',
 		bridge_version: BRIDGE_VERSION,
-		methods: ['health', 'probe', 'open', 'reload', 'undo', 'eval', 'screenshot', 'capture', 'animation_sample'],
+		methods: ['health', 'probe', 'open', 'reload', 'undo', 'eval', 'screenshot', 'capture', 'animation_sample',
+			'scope_get', 'scope_import', 'scope_propose', 'scope_clear'],
 		projects: typeof ModelProject !== 'undefined' && ModelProject.all ? ModelProject.all.map(function (p) {
 			return {uuid: p.uuid, save_path: p.save_path || '', saved: p.saved};
 		}) : []
@@ -506,10 +509,10 @@ async function openProject(path, params) {
 		loaded = await waitProjectReady(path, model, prior.map(function (p) { return p.uuid; }), timeoutMs);
 		if (!params.replace_unsaved && old.some(function (p) { return p.saved === false; })) throw new Error('old project changed while loading');
 		loaded.mcp_bridge_sync = stamp;
-		// Some format plugins mark a freshly parsed document dirty without an edit.
-		// Preserve that flag, but record content for strict read-only provenance.
-		if (loaded.saved === false && (!loaded.undo || !loaded.undo.history.length)) {
-			loaded.mcp_bridge_load_baseline = nativeDocumentContent();
+		// Compare scoped edits against loaded content even if a later native edit is saved.
+		// A freshly parsed dirty document qualifies only if it has no edit history.
+		if (stamp.source_token && (loaded.saved !== false || !loaded.undo || !loaded.undo.history.length)) {
+			loaded.mcp_bridge_load_baseline = safeValue(nativeDocumentContent, null);
 		}
 		var closed = [], warnings = [];
 		for (var i = 0; i < old.length; i++) {
@@ -554,10 +557,534 @@ function captureGuard(params) {
 }
 
 function nativeDocumentContent() {
-	if (!Codecs.project || typeof Codecs.project.compile !== 'function') return null;
+	if (typeof Codecs === 'undefined' || !Codecs.project || typeof Codecs.project.compile !== 'function') return null;
 	// Exclude editor playhead/camera/selection; include every serialized asset.
 	var value = Codecs.project.compile({raw: true, editor_state: false, bitmaps: true});
 	return typeof value === 'string' ? value : JSON.stringify(value);
+}
+
+// Scope geometry is a scene gizmo, separate from the outliner and model subtree.
+function removeScopeOverlay(plugin) {
+	var overlay = plugin.scopeOverlay;
+	if (!overlay) return;
+	overlay.removeFromParent();
+	var index = Canvas.gizmos.indexOf(overlay);
+	if (index >= 0) Canvas.gizmos.splice(index, 1);
+	overlay.traverse(function (item) {
+		if (item.geometry) item.geometry.dispose();
+		if (item.material) item.material.dispose();
+	});
+	plugin.scopeOverlay = null;
+}
+
+function scopeEditingMode() {
+	return typeof Modes === 'undefined' || !Modes.selected || Modes.selected.id === 'edit';
+}
+
+function scopeFaceMode() {
+	return scopeEditingMode() || Modes.selected.id === 'paint';
+}
+
+function cubeScopeBox(cube) {
+	cube.mesh.updateWorldMatrix(true, false);
+	return new THREE.Box3().setFromPoints(cube.getGlobalVertexPositions().map(function (point) {
+		return new THREE.Vector3().fromArray(point);
+	}));
+}
+
+function boxFromScopeBounds(bounds) {
+	return new THREE.Box3(new THREE.Vector3().fromArray(bounds.min), new THREE.Vector3().fromArray(bounds.max));
+}
+
+function lockUVFaces(plugin) {
+	if (!activeProject() || !scopeFaceMode() || typeof UVEditor === 'undefined') {
+		return {ok: false, error: '请在 UV 面板选中要重绘的面'};
+	}
+	var faces = [];
+	var cubes = new Set(Cube.selected);
+	UVEditor.getMappableElements().forEach(function (cube) {
+		if (!cubes.has(cube) || cube.box_uv) return;
+		UVEditor.getSelectedFaces(cube).forEach(function (key) {
+			var face = cube.faces[key];
+			if (SCOPE_FACES.includes(key) && face && face.getTexture()) faces.push({uuid: cube.uuid, face: key});
+		});
+	});
+	if (!faces.length) return {ok: false, error: '请在 UV 面板选中已贴图的面，盒式 UV 可用「设为 MCP 重绘面」'};
+	return setFaceScope(plugin, faces, true);
+}
+
+function scopeUVFaces(scope, texture) {
+	if (!scope || !scope.faces || scope.project !== activeProject()) return [];
+	var cubes = new Map(Cube.all.map(function (cube) { return [cube.uuid, cube]; }));
+	return scope.faces.flatMap(function (ref) {
+		var cube = cubes.get(ref.uuid);
+		var face = cube && cube.faces[ref.face];
+		var atlas = face && face.getTexture();
+		if (!atlas || (texture && texture.uuid !== atlas.uuid)) return [];
+		return [{label: cube.name + ' · ' + SCOPE_FACE_LABELS[ref.face], direction: SCOPE_FACE_LABELS[ref.face], uv: face.uv}];
+	});
+}
+
+function refreshScopeUV(plugin) {
+	if (typeof document === 'undefined' || typeof UVEditor === 'undefined') return;
+	var header = document.getElementById('uv_title_bar');
+	var frame = UVEditor.vue && UVEditor.vue.$refs && UVEditor.vue.$refs.frame;
+	var scope = plugin.editScope;
+	if (!scope || !scope.faces || scope.project !== activeProject() || !scopeFaceMode()) scope = null;
+	if (header && !plugin.scopeUVControls) {
+		var controls = document.createElement('span');
+		controls.className = 'mcp_scope_uv_controls';
+		var button = document.createElement('button');
+		button.type = 'button';
+		button.textContent = '锁定选面';
+		button.title = '锁定 UV 面板中当前选中的面';
+		button.addEventListener('pointerdown', function (event) { event.stopPropagation(); });
+		button.addEventListener('click', function (event) {
+			event.stopPropagation();
+			var result = lockUVFaces(plugin);
+			notify(result.ok ? '已锁定 ' + result.scope.faces.length + ' 个 UV 面' : result.error);
+		});
+		var badge = document.createElement('span');
+		badge.className = 'mcp_scope_uv_badge';
+		controls.append(button, badge);
+		plugin.scopeUVControls = controls;
+		plugin.scopeUVBadge = badge;
+	}
+	if (header) {
+		if (plugin.scopeUVControls.parentNode !== header) header.prepend(plugin.scopeUVControls);
+		var all = scopeUVFaces(scope);
+		plugin.scopeUVBadge.hidden = !all.length;
+		plugin.scopeUVBadge.textContent = scope && !scope.confirmed ? '待确认 ' + all.length + ' 面' : '已锁定 ' + all.length + ' 面';
+		plugin.scopeUVBadge.title = all.map(function (face) { return face.label; }).join('\n');
+		plugin.scopeUVBadge.classList.toggle('pending', Boolean(scope && !scope.confirmed));
+	}
+	if (plugin.scopeUVResize && plugin.scopeUVObservedFrame !== frame) {
+		plugin.scopeUVResize.disconnect();
+		plugin.scopeUVObservedFrame = frame;
+		if (frame) plugin.scopeUVResize.observe(frame);
+	}
+	if (plugin.scopeUVOverlay) {
+		plugin.scopeUVOverlay.remove();
+		plugin.scopeUVOverlay = null;
+	}
+	if (!scope || !frame) return;
+	var texture = UVEditor.texture || (typeof Texture !== 'undefined' && Texture.getDefault());
+	if (!texture) return;
+	var faces = scopeUVFaces(scope, texture);
+	if (!faces.length) return;
+	var overlay = document.createElement('div');
+	overlay.className = 'mcp_scope_uv_overlay' + (scope.confirmed ? '' : ' pending');
+	faces.forEach(function (face) {
+		var uv = face.uv, mark = document.createElement('span');
+		mark.className = 'mcp_scope_uv_mark';
+		var direction = document.createElement('span');
+		direction.className = 'mcp_scope_uv_direction';
+		direction.textContent = face.direction;
+		mark.append(direction);
+		mark.style.left = UVEditor.vue.toPixels(Math.min(uv[0], uv[2]));
+		mark.style.top = UVEditor.vue.toPixels(Math.min(uv[1], uv[3]));
+		mark.style.width = UVEditor.vue.toPixels(Math.abs(uv[2] - uv[0]));
+		mark.style.height = UVEditor.vue.toPixels(Math.abs(uv[3] - uv[1]));
+		overlay.append(mark);
+	});
+	frame.append(overlay);
+	plugin.scopeUVOverlay = overlay;
+}
+
+function queueScopeUVRefresh(plugin) {
+	if (typeof requestAnimationFrame === 'undefined' || plugin.scopeUVFrame !== undefined) return;
+	plugin.scopeUVFrame = requestAnimationFrame(function () {
+		plugin.scopeUVFrame = undefined;
+		refreshScopeUV(plugin);
+	});
+}
+
+function registerScopeUV(plugin) {
+	if (typeof document === 'undefined' || typeof UVEditor === 'undefined' || typeof Blockbench.addCSS !== 'function') return;
+	plugin.scopeUVStyle = Blockbench.addCSS(`
+		.mcp_scope_uv_controls { display: inline-flex; align-items: center; gap: 4px; margin-right: 4px; white-space: nowrap; }
+		.mcp_scope_uv_controls button { font-size: 11px; padding: 1px 4px; min-width: 0; }
+		.mcp_scope_uv_badge { color: #c5ff64; font-size: 11px; }
+		.mcp_scope_uv_badge.pending { color: #ffbb45; }
+		.mcp_scope_uv_overlay { position: absolute; inset: 0; z-index: 20; pointer-events: none; --scope-color: #c5ff64; }
+		.mcp_scope_uv_overlay.pending { --scope-color: #ffbb45; }
+		.mcp_scope_uv_mark { position: absolute; box-sizing: border-box; overflow: hidden; border: 2px solid var(--scope-color);
+			box-shadow: inset 0 0 0 1px #23301c, 0 0 0 1px #23301c; background: #b9f05528; color: #172013; font: bold 11px/13px sans-serif; }
+		.mcp_scope_uv_direction { display: inline-block; padding: 0 2px; background: var(--scope-color); }
+	`);
+	if (typeof ResizeObserver !== 'undefined') {
+		plugin.scopeUVResize = new ResizeObserver(function () { queueScopeUVRefresh(plugin); });
+	}
+	queueScopeUVRefresh(plugin);
+}
+
+function unregisterScopeUV(plugin) {
+	if (plugin.scopeUVFrame !== undefined) cancelAnimationFrame(plugin.scopeUVFrame);
+	if (plugin.scopeUVResize) plugin.scopeUVResize.disconnect();
+	if (plugin.scopeUVControls) plugin.scopeUVControls.remove();
+	if (plugin.scopeUVOverlay) plugin.scopeUVOverlay.remove();
+	if (plugin.scopeUVStyle) plugin.scopeUVStyle.delete();
+	plugin.scopeUVFrame = undefined;
+	plugin.scopeUVResize = plugin.scopeUVObservedFrame = null;
+	plugin.scopeUVControls = plugin.scopeUVBadge = plugin.scopeUVOverlay = plugin.scopeUVStyle = null;
+}
+
+function refreshScopeOverlay(plugin) {
+	queueScopeUVRefresh(plugin);
+	removeScopeOverlay(plugin);
+	var scope = plugin.scopeBoxPreview || plugin.editScope;
+	if (!scope || scope.project !== activeProject() ||
+		!(scope.faces ? scopeFaceMode() : scopeEditingMode())) return;
+	var overlay = new THREE.Group();
+	overlay.no_export = true;
+	var color = scope.confirmed ? 0x26e6ca : 0xffbb45;
+	function outline(box, tint) {
+		var line = new THREE.Box3Helper(box, tint);
+		line.material.depthTest = false;
+		line.material.depthWrite = false;
+		line.renderOrder = 1001;
+		line.raycast = function () {};
+		overlay.add(line);
+	}
+	var box = scope.bounds && boxFromScopeBounds(scope.bounds);
+	if (scope.faces) {
+		color = scope.confirmed ? 0xc5ff64 : 0xffbb45;
+		var cubes = new Map(Cube.all.map(function (cube) { return [cube.uuid, cube]; }));
+		scope.faces.forEach(function (ref) {
+			var cube = cubes.get(ref.uuid);
+			if (!cube || !cube.faces[ref.face]) return;
+			cube.mesh.updateWorldMatrix(true, false);
+			var vertices = cube.getGlobalVertexPositions();
+			var points = cube.faces[ref.face].getVertexIndices().map(function (index) {
+				return new THREE.Vector3().fromArray(vertices[index]);
+			});
+			var line = new THREE.LineLoop(
+				new THREE.BufferGeometry().setFromPoints(points),
+				new THREE.LineBasicMaterial({color: color, depthTest: false, depthWrite: false})
+			);
+			line.renderOrder = 1001;
+			line.raycast = function () {};
+			overlay.add(line);
+			var fill = new THREE.Mesh(
+				new THREE.BufferGeometry().setFromPoints([points[0], points[1], points[2], points[0], points[2], points[3]]),
+				new THREE.MeshBasicMaterial({color: color, side: THREE.DoubleSide, transparent: true,
+					opacity: 0.22, depthTest: false, depthWrite: false})
+			);
+			fill.renderOrder = 1000;
+			fill.raycast = function () {};
+			overlay.add(fill);
+		});
+	} else {
+		var selected = new Set(scope.uuids);
+		Cube.all.forEach(function (cube) {
+			if (!selected.has(cube.uuid) && !box) return;
+			var cubeBox = cubeScopeBox(cube);
+			if (selected.has(cube.uuid)) outline(cubeBox, color);
+			else if (box.intersectsBox(cubeBox)) outline(cubeBox, 0xf76c6c);
+		});
+	}
+	if (box) {
+		var size = box.getSize(new THREE.Vector3());
+		var fill = new THREE.Mesh(
+			new THREE.BoxGeometry(size.x, size.y, size.z),
+			new THREE.MeshBasicMaterial({color: color, transparent: true, opacity: 0.12, depthWrite: false})
+		);
+		fill.position.copy(box.getCenter(new THREE.Vector3()));
+		fill.raycast = function () {};
+		fill.renderOrder = 1000;
+		overlay.add(fill);
+		outline(box, color);
+	}
+	Canvas.scene.add(overlay);
+	Canvas.gizmos.push(overlay);
+	plugin.scopeOverlay = overlay;
+}
+
+function scopeGuard(params) {
+	var project = activeProject();
+	var stamp = project && project.mcp_bridge_sync;
+	if (!stamp || !stamp.source_token || !stamp.project_id || !Number.isInteger(stamp.revision)) {
+		return {ok: false, error: '请先用 project_sync 同步当前工程'};
+	}
+	var guard = captureGuard(params);
+	if (!guard.ok) return guard;
+	if (!project.mcp_bridge_load_baseline || project.mcp_bridge_load_baseline !== nativeDocumentContent()) {
+		return {ok: false, error: 'Blockbench 工程内容已改变，请核对并重新同步后再设定范围'};
+	}
+	return guard;
+}
+
+function scopeResponse(scope) {
+	return {ok: true, scope: scope ? {
+		id: scope.id, uuids: scope.uuids, bounds: scope.bounds, faces: scope.faces, confirmed: scope.confirmed
+	} : null};
+}
+
+function scopeFaceFootprints(faces) {
+	var selected = new Set(faces.map(function (ref) { return ref.uuid + '/' + ref.face; }));
+	var atlasIds = new Set(), rows = [];
+	var project = activeProject();
+	Cube.all.forEach(function (cube) {
+		SCOPE_FACES.forEach(function (key) {
+			var face = cube.faces[key], texture = face && face.getTexture();
+			if (!texture) return;
+			if (selected.has(cube.uuid + '/' + key)) {
+				if (texture.frameCount > 1 || texture.layers_enabled) {
+					throw new Error('局部重绘需要静态、已合并图层的纹理');
+				}
+				atlasIds.add(texture.uuid);
+			}
+			rows.push({uuid: cube.uuid, face: key, texture: texture.uuid, uv: face.uv.slice(),
+				uv_size: [project.getUVWidth(texture), project.getUVHeight(texture)]});
+		});
+	});
+	return rows.filter(function (row) { return atlasIds.has(row.texture); });
+}
+
+function setFaceScope(plugin, faces, confirmed) {
+	if (!scopeFaceMode()) return {ok: false, error: '请在编辑或绘制模式设定面范围'};
+	var project = activeProject();
+	if (!project) return {ok: false, error: '请先打开要重绘的工程'};
+	var cubes = new Map(Cube.all.map(function (cube) { return [cube.uuid, cube]; }));
+	var seen = new Set();
+	if (!Array.isArray(faces) || !faces.length || !faces.every(function (ref) {
+		var cube = ref && cubes.get(ref.uuid);
+		var key = cube && ref.uuid + '/' + ref.face;
+		if (!cube || !SCOPE_FACES.includes(ref.face) || !cube.faces[ref.face] ||
+			!cube.faces[ref.face].getTexture() || seen.has(key)) return false;
+		seen.add(key);
+		return true;
+	})) return {ok: false, error: '范围必须包含当前工程中已贴图且不重复的方块面'};
+	var snapshot = null;
+	if (confirmed) {
+		// A manual confirmation can bind an open or unsaved native project without reloading it.
+		snapshot = nativeDocumentContent();
+		if (!snapshot) return {ok: false, error: '无法读取当前工程的内存快照'};
+		var stamp = project.mcp_bridge_sync;
+		if (!stamp || !stamp.source_token || !stamp.project_id || !Number.isInteger(stamp.revision) ||
+			project.mcp_bridge_load_baseline !== snapshot) {
+			project.mcp_bridge_sync = {project_id: guid(), revision: 0, source_token: guid()};
+			project.mcp_bridge_load_baseline = snapshot;
+		}
+	} else {
+		var guard = scopeGuard({});
+		if (!guard.ok) return guard;
+	}
+	plugin.editScope = {id: guid(), project: project, confirmed: confirmed, manualSnapshot: snapshot,
+		faces: faces.map(function (ref) { return {uuid: ref.uuid, face: ref.face}; })};
+	refreshScopeOverlay(plugin);
+	return scopeResponse(plugin.editScope);
+}
+
+function setEditScope(plugin, uuids, confirmed, bounds) {
+	if (!scopeEditingMode()) return {ok: false, error: '请在 Blockbench 编辑模式设定范围'};
+	var guard = scopeGuard({});
+	if (!guard.ok) return guard;
+	var available = new Set(Cube.all.map(function (cube) { return cube.uuid; }));
+	if (!Array.isArray(uuids) || !uuids.length || new Set(uuids).size !== uuids.length ||
+		!uuids.every(function (uid) { return available.has(uid); })) {
+		return {ok: false, error: '范围必须包含当前工程中存在的方块'};
+	}
+	plugin.editScope = {id: guid(), project: activeProject(), uuids: uuids.slice(),
+		confirmed: confirmed, bounds: bounds || null};
+	refreshScopeOverlay(plugin);
+	return scopeResponse(plugin.editScope);
+}
+
+function getEditScope(plugin, params) {
+	var scope = plugin.editScope;
+	if (!scope) return scopeResponse(null);
+	if (params.detect_only) {
+		var stamp = scope.project.mcp_bridge_sync || {};
+		var matches = params.expect_project_id === stamp.project_id && params.expect_revision === stamp.revision &&
+			params.expect_source_token === stamp.source_token &&
+			(!params.expect_path || samePath(params.expect_path, scope.project.save_path));
+		return scopeResponse(matches ? scope : null);
+	}
+	if (scope.project !== activeProject()) return scopeResponse(null);
+	var guard = scopeGuard(params);
+	if (!guard.ok) return guard;
+	var result = scopeResponse(scope);
+	if (scope.faces) result.scope.footprints = scopeFaceFootprints(scope.faces);
+	return result;
+}
+
+function importEditScope(plugin) {
+	var scope = plugin.editScope;
+	if (!scope || !scope.manualSnapshot || scope.project !== activeProject()) return scopeResponse(null);
+	var result = getEditScope(plugin, {});
+	if (!result.ok) return result;
+	result.stamp = scope.project.mcp_bridge_sync;
+	result.model = JSON.parse(scope.manualSnapshot);
+	return result;
+}
+
+function clearEditScope(plugin) {
+	if (plugin.scopeDialog) plugin.scopeDialog.hide();
+	plugin.scopeDialog = null;
+	plugin.editScope = null;
+	plugin.scopeBoxPreview = null;
+	removeScopeOverlay(plugin);
+	queueScopeUVRefresh(plugin);
+}
+
+function showScopeBoxDialog(plugin) {
+	var guard = scopeGuard({});
+	if (!guard.ok) return notify(guard.error);
+	var project = activeProject();
+	var cubes = Cube.selected.length ? Cube.selected : Cube.all;
+	if (!cubes.length) return notify('工程中没有可框定的方块');
+	var initial = new THREE.Box3();
+	cubes.forEach(function (cube) { initial.union(cubeScopeBox(cube)); });
+	var minimum = initial.min.toArray(), maximum = initial.max.toArray();
+	for (var axis = 0; axis < 3; axis++) {
+		if (minimum[axis] === maximum[axis]) {
+			minimum[axis] -= 0.5;
+			maximum[axis] += 0.5;
+		}
+	}
+	function readBox(values) {
+		if (!values || !Array.isArray(values.min) || !Array.isArray(values.max) ||
+			values.min.length !== 3 || values.max.length !== 3 ||
+			!values.min.every(Number.isFinite) || !values.max.every(Number.isFinite) ||
+			values.min.some(function (lo, i) { return lo >= values.max[i]; })) return null;
+		var bounds = {min: values.min.slice(), max: values.max.slice()};
+		var box = boxFromScopeBounds(bounds);
+		var uuids = Cube.all.filter(function (cube) { return box.containsBox(cubeScopeBox(cube)); })
+			.map(function (cube) { return cube.uuid; });
+		return {bounds: bounds, uuids: uuids};
+	}
+	function previewBox(values) {
+		if (activeProject() !== project) return;
+		var scope = readBox(values);
+		plugin.scopeBoxPreview = scope && Object.assign(scope, {project: project, confirmed: false});
+		refreshScopeOverlay(plugin);
+	}
+	function closeBox() {
+		plugin.scopeDialog = null;
+		plugin.scopeBoxPreview = null;
+		refreshScopeOverlay(plugin);
+	}
+	var dialog = new Dialog({
+		id: 'mcp_scope_box',
+		title: '框定 MCP 修改范围',
+		darken: false,
+		form: {
+			min: {label: '最小坐标 XYZ', type: 'vector', dimensions: 3, value: minimum},
+			max: {label: '最大坐标 XYZ', type: 'vector', dimensions: 3, value: maximum}
+		},
+		onFormChange: previewBox,
+		onConfirm: function (values) {
+			if (activeProject() !== project) {
+				notify('请返回开始框选时的工程');
+				return false;
+			}
+			var scope = readBox(values);
+			if (!scope || !scope.uuids.length) {
+				notify('坐标范围无效，或框内没有完整的方块');
+				return false;
+			}
+			var result = setEditScope(plugin, scope.uuids, true, scope.bounds);
+			if (!result.ok) {
+				notify(result.error);
+				return false;
+			}
+			closeBox();
+			notify('已固定 ' + scope.uuids.length + ' 个框内方块');
+		},
+		onCancel: closeBox
+	});
+	plugin.scopeDialog = dialog;
+	dialog.show();
+	previewBox({min: minimum, max: maximum});
+}
+
+function showScopeFacesDialog(plugin) {
+	if (!Cube.selected.length) return notify('请先选中要重绘的一个或多个方块');
+	var project = activeProject(), form = {}, refs = [];
+	Cube.selected.forEach(function (cube) {
+		SCOPE_FACES.forEach(function (key) {
+			var face = cube.faces[key];
+			if (!face || !face.getTexture()) return;
+			form['face_' + refs.length] = {type: 'checkbox', label: cube.name + ' · ' + SCOPE_FACE_LABELS[key], value: false};
+			refs.push({uuid: cube.uuid, face: key});
+		});
+	});
+	if (!refs.length) return notify('所选方块没有已贴图的面');
+	var dialog = new Dialog({
+		id: 'mcp_scope_faces',
+		title: '设为 MCP 重绘面',
+		form: form,
+		onConfirm: function (values) {
+			if (activeProject() !== project) {
+				notify('请返回开始选面时的工程');
+				return false;
+			}
+			var faces = refs.filter(function (ref, i) { return values['face_' + i]; });
+			var result = setFaceScope(plugin, faces, true);
+			if (!result.ok) {
+				notify(result.error);
+				return false;
+			}
+			plugin.scopeDialog = null;
+			notify('已固定 ' + faces.length + ' 个重绘面');
+		},
+		onCancel: function () { plugin.scopeDialog = null; }
+	});
+	plugin.scopeDialog = dialog;
+	dialog.show();
+}
+
+function registerScopeActions(plugin) {
+	plugin.scopeActions = [];
+	plugin.scopeListeners = {};
+	if (typeof Action === 'undefined' || typeof MenuBar === 'undefined') return;
+	function action(id, name, icon, condition, click) {
+		var item = new Action(id, {name: name, icon: icon, condition: condition, click: click});
+		MenuBar.menus.tools.addAction(item);
+		plugin.scopeActions.push(item);
+	}
+	function editing() { return Boolean(activeProject() && scopeEditingMode()); }
+	function current() { return plugin.editScope && plugin.editScope.project === activeProject(); }
+	action('mcp_scope_select', '设为 MCP 修改范围', 'select_all', editing, function () {
+		var result = setEditScope(plugin, Cube.selected.map(function (cube) { return cube.uuid; }), true);
+		notify(result.ok ? '已固定 ' + result.scope.uuids.length + ' 个方块' : result.error);
+	});
+	action('mcp_scope_confirm', '确认 MCP 提议范围', 'check', function () {
+		return current() && !plugin.editScope.confirmed && (plugin.editScope.faces ? scopeFaceMode() : editing());
+	}, function () {
+		var scope = plugin.editScope;
+		if (!current() || scope.confirmed) return;
+		var guard = scopeGuard({});
+		if (!guard.ok) return notify(guard.error);
+		scope.confirmed = true;
+		refreshScopeOverlay(plugin);
+		notify('已确认 MCP 修改范围');
+	});
+	action('mcp_scope_region', '框定 MCP 修改范围', 'crop_free', editing, function () {
+		if (!plugin.scopeDialog) showScopeBoxDialog(plugin);
+	});
+	action('mcp_scope_faces', '设为 MCP 重绘面', 'texture', function () {
+		return Boolean(activeProject() && scopeFaceMode());
+	}, function () {
+		if (!plugin.scopeDialog) showScopeFacesDialog(plugin);
+	});
+	action('mcp_scope_clear', '清除 MCP 修改范围', 'clear', current, function () {
+		clearEditScope(plugin);
+	});
+	plugin.scopeListeners = {
+		unselect_project: function () { removeScopeOverlay(plugin); queueScopeUVRefresh(plugin); },
+		select_project: function () { refreshScopeOverlay(plugin); },
+		select_mode: function () { refreshScopeOverlay(plugin); },
+		update_selection: function () { queueScopeUVRefresh(plugin); },
+		close_project: function (event) {
+			if (plugin.editScope && plugin.editScope.project === event.project) clearEditScope(plugin);
+		}
+	};
+	Object.keys(plugin.scopeListeners).forEach(function (event) {
+		Blockbench.on(event, plugin.scopeListeners[event]);
+	});
+	registerScopeUV(plugin);
 }
 
 function captureCommand(params) {
@@ -812,6 +1339,23 @@ async function runCommand(plugin, method, params) {
 			return captureCommand(params);
 		case 'animation_sample':
 			return animatedOperation(params || {}, false);
+		case 'scope_get':
+			return getEditScope(plugin, params);
+		case 'scope_import':
+			return importEditScope(plugin);
+		case 'scope_propose':
+			var guard = scopeGuard(params);
+			if (!guard.ok) return guard;
+			if (plugin.editScope) return {ok: false, error: '已有 MCP 修改范围，请先清除'};
+			return params.faces === undefined
+				? setEditScope(plugin, params.uuids, false)
+				: setFaceScope(plugin, params.faces, false);
+		case 'scope_clear':
+			if (plugin.editScope && plugin.editScope.id !== params.scope_id) {
+				return {ok: false, error: 'MCP 修改范围已变更'};
+			}
+			clearEditScope(plugin);
+			return {ok: true};
 		default:
 			return { ok: false, error: 'unknown command: ' + String(method) };
 	}
@@ -990,8 +1534,16 @@ function registerPlugin() {
 			this.port = normalizePort(settingValue('mcp_bridge_port', BRIDGE_PORT));
 			this.allowEval = Boolean(settingValue('mcp_bridge_allow_eval', false));
 			startServer(this);
+			registerScopeActions(this);
 		},
 		onunload: function () {
+			clearEditScope(this);
+			unregisterScopeUV(this);
+			(this.scopeActions || []).forEach(function (action) { action.delete(); });
+			var listeners = this.scopeListeners || {};
+			Object.keys(listeners).forEach(function (event) {
+				Blockbench.removeListener(event, listeners[event]);
+			});
 			if (this.server && typeof this.server.close === 'function') {
 				try { this.server.close(); } catch (e) { /* ignore */ }
 			}
